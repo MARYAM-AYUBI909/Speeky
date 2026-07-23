@@ -202,7 +202,11 @@ async def submit_pronunciation_attempt(
             ).model_dump(),
         )
 
-    user_pref = accent_profile or await accent_calibration_service.get_user_accent_preference(user_id)
+    if isinstance(accent_profile, str):
+        user_pref, sub_pref = accent_profile, None
+    else:
+        user_pref, sub_pref, _ = await accent_calibration_service.get_user_accent_preference(user_id)
+
     conflict_msg = accent_calibration_service.check_drill_conflict(drill_type, user_pref)
     if conflict_msg:
         return JSONResponse(
@@ -213,10 +217,11 @@ async def submit_pronunciation_attempt(
     aligned_words = recording_engine.align_to_sentence(analysis, sentence["text"])
     word_results = [_classify_word(a, analysis.words, analysis.prosody, config) for a in aligned_words]
 
-    # ACC-US-11: Calibrate word results for South Asian accent model
+    # ACC-US-11 & ACC-US-09: Calibrate word results for South Asian accent model & sub-dialect
     word_results, calibration_warning, model_used = accent_calibration_service.calibrate_word_results(
-        word_results, user_pref, drill_type=drill_type
+        word_results, user_pref, sub_dialect_preference=sub_pref, drill_type=drill_type
     )
+
 
     disfluency_detected = recording_engine.detect_disfluency(analysis, config)
     overall_score = _overall_score(word_results) if not has_breakdown else clarity_fallback

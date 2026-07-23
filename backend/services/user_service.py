@@ -63,12 +63,23 @@ async def update_profile(payload: UpdateProfileSchema, user_id: str = Depends(re
     return {"user": _serialize(user)}
 
 async def get_accent_preference(user_id: str = Depends(require_auth)):
-    pref = await get_user_accent_preference(user_id)
-    return AccentPreferenceSchema(accent_model_preference=pref)
+    pref, sub_dialect, notice = await get_user_accent_preference(user_id)
+    return AccentPreferenceSchema(
+        accent_model_preference=pref,
+        sub_dialect_preference=sub_dialect,
+        notice=notice,
+    )
 
 async def set_accent_preference(payload: UpdateAccentPreferenceSchema, user_id: str = Depends(require_auth)):
-    pref = await update_user_accent_preference(user_id, payload.accent_model_preference)
-    return AccentPreferenceSchema(accent_model_preference=pref)
+    pref, sub_dialect, notice = await update_user_accent_preference(
+        user_id, payload.accent_model_preference, payload.sub_dialect_preference
+    )
+    return AccentPreferenceSchema(
+        accent_model_preference=pref,
+        sub_dialect_preference=sub_dialect,
+        notice=notice,
+    )
+
 
 
 def _process_avatar(contents: bytes) -> bytes:

@@ -322,7 +322,7 @@ async def submit_passage_assessment(
             content=RecordingRejectedSchema(reason=rejection.value, message=_REJECTION_MESSAGES[rejection]).model_dump(),
         )
 
-    user_pref = await accent_calibration_service.get_user_accent_preference(user_id)
+    user_pref, sub_pref, pref_notice = await accent_calibration_service.get_user_accent_preference(user_id)
     conflict_msg = accent_calibration_service.check_drill_conflict(drill_type, user_pref)
     
     if conflict_msg:
@@ -337,9 +337,9 @@ async def submit_passage_assessment(
     intonation_score = _intonation_score(analysis.prosody, config)
     clarity_score = _clarity_score(aligned_words, config) if not has_breakdown else clarity_fallback
 
-    # ACC-US-11: Calibrate for South Asian English regional stress patterns
-    warning_notice = breakdown_warning
-    model_used = user_pref
+    # ACC-US-11 & ACC-US-09: Calibrate for South Asian English regional stress patterns & sub-dialects
+    warning_notice = breakdown_warning or pref_notice
+    model_used = f"south_asian_pakistani:{sub_pref}" if (user_pref == "south_asian_pakistani" and sub_pref) else user_pref
     if user_pref == "south_asian_pakistani":
         if not config.local_accent_model_available:
             warning_notice = "Local acoustic model failed to load due to network latency. Defaulting to Generic Global model."

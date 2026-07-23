@@ -100,9 +100,10 @@ model User {
   pronunciationAttempts PronunciationAttempt[]
   accentProfiles        AccentProfile[]
   publicSpeakingSessions PublicSpeakingSession[]
-  // US-80/US-90: Live Speech Verification & Local Accent Calibration
+  // US-80/US-90/ACC-US-09: Live Speech Verification & Local Accent Calibration (Sub-Dialects)
   livenessFlags         LivenessFlag[]
   accentModelPreference String                 @default("generic_global")
+  subDialectPreference  String?
   livenessFlagCount     Int                    @default(0)
   isAccentSuspended     Boolean                @default(false)
 

@@ -14,6 +14,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { FillerWordsScorecardSection } from "@/components/dashboard/public-speaking/FillerWordsScorecardSection";
 
 const SPEECH_TYPE_CONFIG: Record<string, { label: string; description: string; ideal_wpm: string }> = {
   business_pitch: {
@@ -348,17 +349,8 @@ export default function PublicSpeakingSessionPage() {
             </div>
           </div>
 
-          {scorecard.filler_word_count > 0 && (
-            <div className="rounded-lg bg-warning/10 border border-warning/20 p-4">
-              <div className="flex items-center gap-2 text-sm font-medium text-warning-foreground">
-                <AlertCircle className="h-4 w-4" />
-                <span>Filler Words: {scorecard.filler_word_count}</span>
-              </div>
-              <p className="mt-2 text-sm text-muted-foreground">
-                Try pausing silently instead of using "um" or "ah".
-              </p>
-            </div>
-          )}
+          {sessionId && <FillerWordsScorecardSection sessionId={sessionId} />}
+
 
           <div className="rounded-lg bg-secondary/20 p-4">
             <div className="flex items-start gap-3">

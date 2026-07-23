@@ -100,6 +100,10 @@ model User {
   pronunciationAttempts PronunciationAttempt[]
   accentProfiles        AccentProfile[]
   publicSpeakingSessions PublicSpeakingSession[]
+  livenessFlags         LivenessFlag[]
+  accentModelPreference String                 @default("generic_global")
+  livenessFlagCount     Int                    @default(0)
+  isAccentSuspended     Boolean                @default(false)
 
   @@map("users")
 }
@@ -358,3 +362,19 @@ model PublicSpeakingSession {
   @@index([userId, completedAt])
   @@map("public_speaking_sessions")
 }
+
+model LivenessFlag {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  passageId    String?
+  sentenceId   String?
+  promptToken  String?
+  reason       String
+  appealed     Boolean   @default(false)
+  appealPassed Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+
+  @@index([userId, createdAt])
+  @@map("liveness_flags")
+}

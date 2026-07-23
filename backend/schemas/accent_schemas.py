@@ -8,6 +8,7 @@ class TargetPassageSchema(BaseModel):
     difficulty: str
     title: str
     text: str
+    prompt_token: Optional[str] = None
 
 
 class WeakPointSchema(BaseModel):
@@ -26,6 +27,8 @@ class AccentAssessmentResultSchema(BaseModel):
     intonation_score: Optional[float] = None
     clarity_score: Optional[float] = None
     weak_points: List[WeakPointSchema] = []
+    warning: Optional[str] = None
+    model_used: Optional[str] = None
 
 
 class AccentProfileSchema(BaseModel):
@@ -47,3 +50,15 @@ class RecordingRejectedSchema(BaseModel):
     status: str = "rejected"
     reason: str
     message: str
+    appeal_token: Optional[str] = None
+    appeal_prompt: Optional[str] = None
+
+
+class LivenessAppealRequestSchema(BaseModel):
+    appeal_token: str
+
+
+class LivenessAppealResponseSchema(BaseModel):
+    appeal_passed: bool
+    message: str
+

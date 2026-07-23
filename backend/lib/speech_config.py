@@ -80,6 +80,12 @@ class SpeechConfig:
     pronunciation_tts_slow_length_scale: float
     pronunciation_tts_cache_ttl_seconds: int
 
+    # ── Live Speech Verification (ACC-US-01) & Local Accent Calibration (ACC-US-11)
+    liveness_min_noise_floor_dbfs: float
+    liveness_token_ttl_seconds: int
+    local_accent_model_available: bool
+
+
 
 def load_speech_config() -> SpeechConfig:
     return SpeechConfig(
@@ -119,4 +125,8 @@ def load_speech_config() -> SpeechConfig:
         exercise_batch_size=_int_env("EXERCISE_BATCH_SIZE", 6),
         pronunciation_tts_slow_length_scale=_float_env("PRONUNCIATION_TTS_SLOW_LENGTH_SCALE", 1.6),
         pronunciation_tts_cache_ttl_seconds=_int_env("PRONUNCIATION_TTS_CACHE_TTL_SECONDS", 604800),
+        liveness_min_noise_floor_dbfs=_float_env("LIVENESS_MIN_NOISE_FLOOR_DBFS", -75.0),
+        liveness_token_ttl_seconds=_int_env("LIVENESS_TOKEN_TTL_SECONDS", 900),
+        local_accent_model_available=_str_env("LOCAL_ACCENT_MODEL_AVAILABLE", "true").lower() in ("true", "1", "yes"),
     )
+

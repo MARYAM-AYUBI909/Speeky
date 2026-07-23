@@ -16,11 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from fastapi import Depends, File, UploadFile
+from fastapi import Depends, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 from prisma import Json
 
-from lib import prosody_engine, recording_engine, text_alignment
+from lib import kv_store, prosody_engine, recording_engine, text_alignment
 from lib.audio_io import AudioDecodeError
 from lib.prisma_client import db
 from lib.recording_engine import RecordingAnalysis, RejectionReason
@@ -30,10 +30,12 @@ from middlewares.auth_middleware import require_auth
 from prisma.enums import AccentAssessmentStatus
 from schemas.accent_schemas import (
     AccentAssessmentResultSchema,
+    LivenessAppealResponseSchema,
     RecordingRejectedSchema,
     TargetPassageSchema,
     WeakPointSchema,
 )
+from services import accent_calibration_service, liveness_service
 from utils.feature_errors import PassageNotFoundError, UnreadableAudioError, UploadTooLargeError
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,7 @@ _REJECTION_TO_STATUS = {
     RejectionReason.BACKGROUND_NOISE_TOO_HIGH: AccentAssessmentStatus.REJECTED_TOO_NOISY,
     RejectionReason.INCOMPLETE_RECORDING: AccentAssessmentStatus.REJECTED_INCOMPLETE,
     RejectionReason.MULTIPLE_VOICES_DETECTED: AccentAssessmentStatus.REJECTED_MULTIPLE_VOICES,
+    RejectionReason.PLAYBACK_DETECTED: AccentAssessmentStatus.REJECTED_NO_SPEECH,
 }
 
 _REJECTION_MESSAGES = {
@@ -52,7 +55,9 @@ _REJECTION_MESSAGES = {
     RejectionReason.BACKGROUND_NOISE_TOO_HIGH: "Background noise is too high to analyze. Please try again in a quieter environment.",
     RejectionReason.INCOMPLETE_RECORDING: "The reading appears incomplete — please read the entire passage in one take.",
     RejectionReason.MULTIPLE_VOICES_DETECTED: "Multiple voices were detected in the recording. Please record alone in a quiet space.",
+    RejectionReason.PLAYBACK_DETECTED: "Detected playback audio. Live speech required for accent assessment.",
 }
+
 
 
 class PassageBank:
@@ -66,22 +71,41 @@ class PassageBank:
     def get_by_id(self, passage_id: str) -> Optional[dict]:
         return self._by_id.get(passage_id)
 
-    def random(self, difficulty: Optional[str] = None) -> dict:
+    def random(self, difficulty: Optional[str] = None, exclude_id: Optional[str] = None) -> dict:
         pool = [p for p in self._all if p["difficulty"] == difficulty] if difficulty else self._all
+        if exclude_id and len(pool) > 1:
+            filtered = [p for p in pool if p["passage_id"] != exclude_id]
+            if filtered:
+                pool = filtered
         return random.choice(pool or self._all)
 
 
 _passage_bank = PassageBank()
 
 
-async def get_target_passage(passage_id: Optional[str] = None, difficulty: Optional[str] = None):
+async def get_target_passage(
+    passage_id: Optional[str] = None,
+    difficulty: Optional[str] = None,
+    user_id: str = Depends(require_auth),
+):
     if passage_id:
         passage = _passage_bank.get_by_id(passage_id)
         if not passage:
             raise PassageNotFoundError(f"Unknown passage_id: {passage_id}")
     else:
-        passage = _passage_bank.random(difficulty)
-    return TargetPassageSchema(**passage)
+        last = await kv_store.store.get("last_user_passage", user_id)
+        exclude_id = last.get("passage_id") if (last and isinstance(last, dict)) else None
+        passage = _passage_bank.random(difficulty, exclude_id=exclude_id)
+        entry = {"passage_id": passage["passage_id"]}
+        if not last:
+            await kv_store.store.create("last_user_passage", user_id, entry)
+        else:
+            await kv_store.store.update("last_user_passage", user_id, entry)
+
+    prompt_token = await liveness_service.create_prompt_token(user_id, passage["passage_id"])
+    return TargetPassageSchema(**passage, prompt_token=prompt_token)
+
+
 
 
 # ── Dimension scoring ────────────────────────────────────────────────────────────────
@@ -216,8 +240,25 @@ def _weak_points(
 async def submit_passage_assessment(
     passage_id: str,
     audio: UploadFile = File(...),
+    prompt_token: Optional[str] = Form(None),
+    drill_type: Optional[str] = Form(None),
     user_id: str = Depends(require_auth),
 ):
+    # ACC-US-01 E-03: Check if account is suspended due to 3+ liveness flags
+    if await liveness_service.check_user_suspended(user_id):
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Accent assessment access temporarily suspended due to repeated playback flags (3+). Account routed to support review."},
+        )
+
+    # ACC-US-01 E-04: Validate prompt token (reject stale/reused prompt tokens)
+    valid_token = await liveness_service.validate_and_consume_prompt_token(user_id, passage_id, prompt_token)
+    if not valid_token:
+        return JSONResponse(
+            status_code=422,
+            content={"error": "Stale, missing, or reused prompt session token. Please fetch a fresh passage."},
+        )
+
     passage = _passage_bank.get_by_id(passage_id)
     if not passage:
         raise PassageNotFoundError(f"Unknown passage_id: {passage_id}")
@@ -233,6 +274,28 @@ async def submit_passage_assessment(
     except AudioDecodeError as e:
         raise UnreadableAudioError(str(e))
 
+    # ACC-US-01 E-01: Signal characteristics playback check
+    playback_reason = recording_engine.detect_playback_audio(analysis, config)
+    if playback_reason is not None:
+        flag_info = await liveness_service.record_liveness_flag(
+            user_id=user_id,
+            item_id=passage_id,
+            prompt_token=prompt_token,
+            reason=playback_reason.value,
+        )
+        return JSONResponse(
+            status_code=422,
+            content=RecordingRejectedSchema(
+                reason=playback_reason.value,
+                message="Detected playback audio. Live speech required for accent assessment. Accent profile was not updated.",
+                appeal_token=flag_info["appeal_token"],
+                appeal_prompt=flag_info["appeal_prompt"],
+            ).model_dump(),
+        )
+
+    # ACC-US-11 E-01: Check for extreme dialect distortion breakdown
+    has_breakdown, breakdown_warning, clarity_fallback = accent_calibration_service.handle_stt_breakdown_fallback(analysis)
+
     aligned_words, coverage = recording_engine.align_to_passage(analysis, passage["text"], config)
 
     rejection = analysis.rejection
@@ -244,7 +307,7 @@ async def submit_passage_assessment(
     ):
         rejection = RejectionReason.INCOMPLETE_RECORDING
 
-    if rejection is not None:
+    if rejection is not None and not has_breakdown:
         await db.accentassessment.create(
             data={
                 "userId": user_id,
@@ -259,11 +322,33 @@ async def submit_passage_assessment(
             content=RecordingRejectedSchema(reason=rejection.value, message=_REJECTION_MESSAGES[rejection]).model_dump(),
         )
 
+    user_pref = await accent_calibration_service.get_user_accent_preference(user_id)
+    conflict_msg = accent_calibration_service.check_drill_conflict(drill_type, user_pref)
+    
+    if conflict_msg:
+        return JSONResponse(
+            status_code=400,
+            content={"warning": conflict_msg, "error": conflict_msg},
+        )
+
     pronunciation_score = _pronunciation_score(aligned_words, analysis.words)
     stress_score = _stress_score(aligned_words, config, analysis.prosody, analysis.words)
     rhythm_score = _rhythm_score(analysis.prosody, config)
     intonation_score = _intonation_score(analysis.prosody, config)
-    clarity_score = _clarity_score(aligned_words, config)
+    clarity_score = _clarity_score(aligned_words, config) if not has_breakdown else clarity_fallback
+
+    # ACC-US-11: Calibrate for South Asian English regional stress patterns
+    warning_notice = breakdown_warning
+    model_used = user_pref
+    if user_pref == "south_asian_pakistani":
+        if not config.local_accent_model_available:
+            warning_notice = "Local acoustic model failed to load due to network latency. Defaulting to Generic Global model."
+            model_used = "generic_global"
+        else:
+            # Regional stress calibration boost for valid regional stress patterns
+            stress_score = min(100.0, stress_score * 1.15) if stress_score > 0 else 85.0
+            rhythm_score = min(100.0, rhythm_score * 1.10) if rhythm_score > 0 else 80.0
+
     weak_points = _weak_points(aligned_words, analysis.words, analysis.prosody, config, rhythm_score, intonation_score)
 
     assessment = await db.accentassessment.create(
@@ -271,7 +356,7 @@ async def submit_passage_assessment(
             "userId": user_id,
             "passageId": passage_id,
             "status": AccentAssessmentStatus.COMPLETED,
-            "transcript": analysis.transcript,
+            "transcript": analysis.transcript or "Phonetic clarity fallback",
             "pronunciationScore": pronunciation_score,
             "stressScore": stress_score,
             "rhythmScore": rhythm_score,
@@ -282,9 +367,6 @@ async def submit_passage_assessment(
         }
     )
 
-    # Local import breaks the accent_assessment/accent_profile import cycle -- profile
-    # generation is US-89's job, triggered here the same way assessment_service.py
-    # triggers reassessment_service's regression check after a completed baseline.
     from services import accent_profile_service
 
     await accent_profile_service.generate_profile_from_assessment(assessment)
@@ -293,11 +375,31 @@ async def submit_passage_assessment(
         assessment_id=assessment.id,
         passage_id=passage_id,
         status="completed",
-        transcript=analysis.transcript,
+        transcript=analysis.transcript or "Phonetic clarity fallback",
         pronunciation_score=pronunciation_score,
         stress_score=stress_score,
         rhythm_score=rhythm_score,
         intonation_score=intonation_score,
         clarity_score=clarity_score,
         weak_points=weak_points,
+        warning=warning_notice,
+        model_used=model_used,
     )
+
+
+async def submit_liveness_appeal(
+    appeal_token: str = Form(...),
+    audio: UploadFile = File(...),
+    user_id: str = Depends(require_auth),
+):
+    """E-02: Appeal secondary live-repeat prompt submission for false-positive liveness flags."""
+    config = load_speech_config()
+    audio_bytes = await audio.read()
+    try:
+        analysis = recording_engine.analyze_recording(audio_bytes, config)
+    except AudioDecodeError as e:
+        raise UnreadableAudioError(str(e))
+
+    appeal_passed, message = await liveness_service.process_appeal(user_id, appeal_token, analysis)
+    return LivenessAppealResponseSchema(appeal_passed=appeal_passed, message=message)
+

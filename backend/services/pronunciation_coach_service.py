@@ -30,6 +30,7 @@ from schemas.pronunciation_schemas import (
     TargetSentenceSchema,
     WordResultSchema,
 )
+from services import accent_calibration_service, liveness_service
 from utils.feature_errors import (
     InvalidSubmissionError,
     SentenceNotFoundError,
@@ -38,6 +39,7 @@ from utils.feature_errors import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 _STATUS_POINTS = {
     WordStatus.CORRECT: 100.0,
@@ -107,22 +109,53 @@ def _overall_score(word_results: List[WordResultSchema]) -> float:
     return round(sum(points) / len(points), 2)
 
 
-async def get_target_sentence(sentence_id: Optional[str] = None, difficulty: Optional[str] = None):
+async def get_target_sentence(
+    sentence_id: Optional[str] = None,
+    difficulty: Optional[str] = None,
+    user_id: str = Depends(require_auth),
+):
     if sentence_id:
         sentence = _sentence_bank.get_by_id(sentence_id)
         if not sentence:
             raise SentenceNotFoundError(f"Unknown sentence_id: {sentence_id}")
     else:
-        sentence = _sentence_bank.random(difficulty)
-    return TargetSentenceSchema(**sentence)
+        last = await kv_store.store.get("last_user_sentence", user_id)
+        exclude_id = last.get("sentence_id") if (last and isinstance(last, dict)) else None
+        sentence = _sentence_bank.random(difficulty, exclude_id=exclude_id)
+        entry = {"sentence_id": sentence["sentence_id"]}
+        if not last:
+            await kv_store.store.create("last_user_sentence", user_id, entry)
+        else:
+            await kv_store.store.update("last_user_sentence", user_id, entry)
+
+    prompt_token = await liveness_service.create_prompt_token(user_id, sentence["sentence_id"])
+    return TargetSentenceSchema(**sentence, prompt_token=prompt_token)
 
 
 async def submit_pronunciation_attempt(
     sentence_id: str,
     audio: UploadFile = File(...),
     accent_profile: Optional[str] = Form(None),
+    prompt_token: Optional[str] = Form(None),
+    drill_type: Optional[str] = Form(None),
     user_id: str = Depends(require_auth),
 ):
+    # ACC-US-01 E-03: Account suspension check
+    if await liveness_service.check_user_suspended(user_id):
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Accent assessment access temporarily suspended due to repeated playback flags (3+). Account routed to support review."},
+        )
+
+    # ACC-US-01 E-04: Prompt token validation (if provided)
+    if prompt_token is not None:
+        valid_token = await liveness_service.validate_and_consume_prompt_token(user_id, sentence_id, prompt_token)
+        if not valid_token:
+            return JSONResponse(
+                status_code=422,
+                content={"error": "Stale, missing, or reused prompt session token. Please fetch a fresh sentence."},
+            )
+
     sentence = _sentence_bank.get_by_id(sentence_id)
     if not sentence:
         raise SentenceNotFoundError(f"Unknown sentence_id: {sentence_id}")
@@ -138,7 +171,29 @@ async def submit_pronunciation_attempt(
     except AudioDecodeError as e:
         raise UnreadableAudioError(str(e))
 
-    if analysis.rejection is not None:
+    # ACC-US-01 E-01: Playback audio signal check
+    playback_reason = recording_engine.detect_playback_audio(analysis, config)
+    if playback_reason is not None:
+        flag_info = await liveness_service.record_liveness_flag(
+            user_id=user_id,
+            item_id=sentence_id,
+            prompt_token=prompt_token,
+            reason=playback_reason.value,
+        )
+        return JSONResponse(
+            status_code=422,
+            content=RecordingRejectedSchema(
+                reason=playback_reason.value,
+                message="Detected playback audio. Live speech required.",
+                appeal_token=flag_info["appeal_token"],
+                appeal_prompt=flag_info["appeal_prompt"],
+            ).model_dump(),
+        )
+
+    # ACC-US-11 E-01: Check STT breakdown fallback
+    has_breakdown, breakdown_warning, clarity_fallback = accent_calibration_service.handle_stt_breakdown_fallback(analysis)
+
+    if analysis.rejection is not None and not has_breakdown:
         return JSONResponse(
             status_code=422,
             content=RecordingRejectedSchema(
@@ -147,25 +202,34 @@ async def submit_pronunciation_attempt(
             ).model_dump(),
         )
 
-    aligned_words = recording_engine.align_to_sentence(analysis, sentence["text"])
+    user_pref = accent_profile or await accent_calibration_service.get_user_accent_preference(user_id)
+    conflict_msg = accent_calibration_service.check_drill_conflict(drill_type, user_pref)
+    if conflict_msg:
+        return JSONResponse(
+            status_code=400,
+            content={"warning": conflict_msg, "error": conflict_msg},
+        )
 
+    aligned_words = recording_engine.align_to_sentence(analysis, sentence["text"])
     word_results = [_classify_word(a, analysis.words, analysis.prosody, config) for a in aligned_words]
-    word_results = apply_accent_calibration(word_results, accent_profile)
+
+    # ACC-US-11: Calibrate word results for South Asian accent model
+    word_results, calibration_warning, model_used = accent_calibration_service.calibrate_word_results(
+        word_results, user_pref, drill_type=drill_type
+    )
 
     disfluency_detected = recording_engine.detect_disfluency(analysis, config)
-    overall_score = _overall_score(word_results)
-
-    accent_profile_tag = accent_profile or config.default_accent_profile
+    overall_score = _overall_score(word_results) if not has_breakdown else clarity_fallback
 
     existing = await db.pronunciationattempt.find_unique(
         where={"userId_sentenceId": {"userId": user_id, "sentenceId": sentence_id}}
     )
     data = {
         "targetText": sentence["text"],
-        "transcript": analysis.transcript,
+        "transcript": analysis.transcript or "Phonetic clarity fallback",
         "wordResults": Json([w.model_dump() for w in word_results]),
         "overallScore": overall_score,
-        "accentProfileTag": accent_profile_tag,
+        "accentProfileTag": model_used,
         "backgroundVoiceDetected": analysis.multiple_voices_detected,
         "disfluencyDetected": disfluency_detected,
     }
@@ -180,18 +244,22 @@ async def submit_pronunciation_attempt(
             data={"userId": user_id, "sentenceId": sentence_id, "attemptCount": 1, **data}
         )
 
+    warning_notice = breakdown_warning or calibration_warning
     return PronunciationResultSchema(
         attempt_id=attempt.id,
         sentence_id=sentence_id,
         target_text=sentence["text"],
-        transcript=analysis.transcript,
+        transcript=analysis.transcript or "Phonetic clarity fallback",
         overall_score=overall_score,
         word_results=word_results,
         attempt_count=attempt.attemptCount,
         background_voice_detected=analysis.multiple_voices_detected,
         disfluency_detected=disfluency_detected,
-        accent_profile=accent_profile_tag,
+        accent_profile=model_used,
+        warning=warning_notice,
+        model_used=model_used,
     )
+
 
 
 def _tts_cache_key(word: str, speed: str) -> str:

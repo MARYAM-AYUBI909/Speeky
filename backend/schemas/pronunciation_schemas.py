@@ -8,6 +8,7 @@ class TargetSentenceSchema(BaseModel):
     difficulty: str
     text: str
     focus_sounds: List[str]
+    prompt_token: Optional[str] = None
 
 
 class WordResultSchema(BaseModel):
@@ -28,6 +29,8 @@ class PronunciationResultSchema(BaseModel):
     background_voice_detected: bool
     disfluency_detected: bool
     accent_profile: Optional[str] = None
+    warning: Optional[str] = None
+    model_used: Optional[str] = None
 
 
 class RecordingRejectedSchema(BaseModel):
@@ -36,3 +39,6 @@ class RecordingRejectedSchema(BaseModel):
     status: str = "rejected"
     reason: str
     message: str
+    appeal_token: Optional[str] = None
+    appeal_prompt: Optional[str] = None
+

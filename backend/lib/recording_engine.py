@@ -25,6 +25,8 @@ class RejectionReason(str, Enum):
     BACKGROUND_NOISE_TOO_HIGH = "background_noise_too_high"
     INCOMPLETE_RECORDING = "incomplete_recording"
     MULTIPLE_VOICES_DETECTED = "multiple_voices_detected"
+    PLAYBACK_DETECTED = "playback_detected"
+
 
 
 @dataclass
@@ -155,3 +157,22 @@ def detect_disfluency(analysis: RecordingAnalysis, config: SpeechConfig) -> bool
         if prev.word.lower() == curr.word.lower() and (curr.start - prev.end) <= config.disfluency_repetition_window_seconds:
             return True
     return False
+
+
+def detect_playback_audio(analysis: RecordingAnalysis, config: SpeechConfig) -> Optional[RejectionReason]:
+    """ACC-US-01: Detect pre-recorded or synthetic playback file audio based on signal characteristics.
+    
+    Checks ambient noise floor cutoffs, flat artificial noise floor (< -75.0 dBFS or near zero),
+    excessively high SNR (> 55 dBFS), or zero pitch variance on speech segments.
+    """
+    if analysis.noise_floor_dbfs < config.liveness_min_noise_floor_dbfs:
+        return RejectionReason.PLAYBACK_DETECTED
+    if analysis.snr_db > 55.0 and analysis.duration_seconds > 2.0:
+        return RejectionReason.PLAYBACK_DETECTED
+    if analysis.prosody and len(analysis.prosody.f0_contour) > 10:
+        import numpy as np
+        voiced = [f for f in analysis.prosody.f0_contour if f > 0]
+        if len(voiced) > 10 and np.std(voiced) < 0.5:
+            return RejectionReason.PLAYBACK_DETECTED
+    return None
+

@@ -11,7 +11,7 @@ __pycache__/
 *.zip
 Dockerfile*
 .dockerignore
-*.docx
+#*.docx
 
 !.env.example
 !uploads/avatars/

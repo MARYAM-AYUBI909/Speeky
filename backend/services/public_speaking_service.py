@@ -306,7 +306,8 @@ async def _generate_scorecard(
     wpm_metrics = _calculate_wpm(text_content, audio_features)
     
     # Analyze filler words (PSC-US-08)
-    filler_analysis = _analyze_filler_words(text_content)
+    filler_analysis = _analyze_filler_words(text_content, audio_features)
+
     
     # Assess tone variation and energy (PSC-US-05, PSC-US-07)
     tone_analysis = _analyze_tone_variation(text_content, audio_features)
@@ -404,32 +405,39 @@ def _calculate_wpm(text: str, audio_features: Optional[AudioFeatures]) -> Dict:
     }
 
 
-def _analyze_filler_words(text: str) -> Dict:
-    """Analyze filler word usage"""
-    filler_words = []
-    text_lower = text.lower()
+from services import filler_word_service
+
+def _analyze_filler_words(text: str, audio_features: Optional[AudioFeatures] = None) -> Dict:
+    """Analyze filler word usage using filler_word_service (PSC-US-08)"""
+    af_dict = None
+    if audio_features:
+        af_dict = {
+            "duration_seconds": audio_features.duration_seconds,
+            "word_timings": getattr(audio_features, "word_timings", []),
+            "avg_db": getattr(audio_features, "avg_db", None),
+        }
+
+    analysis = filler_word_service.analyze_filler_words(text, audio_features=af_dict)
     
-    for pattern in FILLER_PATTERNS:
-        matches = re.finditer(pattern, text_lower)
-        for match in matches:
-            filler_words.append({
-                "word": match.group(),
-                "position": match.start(),
-            })
-    
-    # Distinguish "like" as filler vs. valid usage (PSC-US-08 E-01)
-    valid_like_contexts = ["i like", "would like", "you like", "they like"]
-    filler_words = [
-        fw for fw in filler_words 
-        if not (fw["word"] == "like" and 
-                any(ctx in text_lower[max(0, fw["position"]-10):fw["position"]+10] 
-                    for ctx in valid_like_contexts))
+    words_list = [
+        {
+            "word": m.word,
+            "position": m.position,
+            "start_time": m.start_time,
+            "end_time": m.end_time,
+        }
+        for m in analysis.timeline_markers
     ]
-    
+
     return {
-        "count": len(filler_words),
-        "words": filler_words,
+        "count": analysis.total_filler_count,
+        "words": words_list,
+        "flawless_delivery": analysis.flawless_delivery,
+        "badge": analysis.badge,
+        "filler_frequencies": analysis.filler_frequencies,
+        "actionable_tip": analysis.actionable_tip,
     }
+
 
 
 def _analyze_tone_variation(text: str, audio_features: Optional[AudioFeatures]) -> Dict:

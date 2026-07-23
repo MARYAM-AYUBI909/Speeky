@@ -60,6 +60,20 @@ export default function PublicSpeakingSessionPage() {
   const [qaScore, setQaScore] = React.useState<any>(null);
   const [error, setError] = React.useState<string | null>(null);
 
+  const mediaRecorderRef = React.useRef<MediaRecorder | null>(null);
+  const audioChunksRef = React.useRef<Blob[]>([]);
+  const audioBase64Ref = React.useRef<string | null>(null);
+  const [hasRecording, setHasRecording] = React.useState(false);
+
+  function blobToBase64(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve((reader.result as string).split(",")[1] ?? "");
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
   const handleStartSession = async () => {
     setIsSubmitting(true);
     setError(null);
@@ -84,6 +98,10 @@ export default function PublicSpeakingSessionPage() {
 
   const handleSubmitSpeech = async () => {
     if (!sessionId) return;
+    if (inputMode === "audio" && !audioBase64Ref.current) {
+      setError("Record your speech before submitting.");
+      return;
+    }
     setIsSubmitting(true);
     setError(null);
     try {
@@ -91,7 +109,7 @@ export default function PublicSpeakingSessionPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          audio_data: null, // Would be base64 audio in real implementation
+          audio_data: inputMode === "audio" ? audioBase64Ref.current : null,
           text_content: inputMode === "text" ? textContent : null,
           is_final: true,
         }),
@@ -132,9 +150,35 @@ export default function PublicSpeakingSessionPage() {
     }
   };
 
-  const handleToggleRecording = () => {
-    setIsRecording(!isRecording);
-    // In real implementation, this would start/stop audio recording
+  const handleToggleRecording = async () => {
+    if (isRecording) {
+      mediaRecorderRef.current?.stop();
+      setIsRecording(false);
+      return;
+    }
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop());
+        const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        audioBase64Ref.current = await blobToBase64(blob);
+        setHasRecording(true);
+      };
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setHasRecording(false);
+      setIsRecording(true);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Microphone permission denied.",
+      );
+    }
   };
 
   return (
@@ -142,9 +186,9 @@ export default function PublicSpeakingSessionPage() {
       <div className="flex items-center gap-4">
         <Button
           variant="ghost"
-          size="icon"
+          size="sm"
           onClick={() => router.back()}
-          className="shrink-0"
+          className="!w-9 shrink-0 !px-0"
         >
           <ArrowLeft className="h-5 w-5" />
         </Button>
@@ -256,16 +300,21 @@ export default function PublicSpeakingSessionPage() {
             </div>
           ) : (
             <Textarea
+              label="Your speech"
               value={textContent}
               onChange={(e) => setTextContent(e.target.value)}
               placeholder="Type your speech here..."
-              className="min-h-[200px] resize-none"
+              rows={8}
             />
           )}
 
           <Button
             onClick={handleSubmitSpeech}
-            disabled={isSubmitting || (inputMode === "text" && !textContent.trim())}
+            disabled={
+              isSubmitting ||
+              isRecording ||
+              (inputMode === "text" ? !textContent.trim() : !hasRecording)
+            }
             className="w-full"
           >
             {isSubmitting ? "Analyzing..." : "Submit for Analysis"}
@@ -361,10 +410,11 @@ export default function PublicSpeakingSessionPage() {
           </div>
 
           <Textarea
+            label="Your response"
             value={qaResponse}
             onChange={(e) => setQaResponse(e.target.value)}
             placeholder="Type your response..."
-            className="min-h-[120px] resize-none"
+            rows={5}
           />
 
           <Button

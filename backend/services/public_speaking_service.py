@@ -13,6 +13,8 @@ Focuses on:
 - Casual event speech feedback
 """
 
+import base64
+import binascii
 import logging
 import re
 import uuid
@@ -20,9 +22,11 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import Depends
-from lib import llm_client, prompts, session_scorer, audio_io, stt_engine, vad_engine, prosody_engine
+from lib import llm_client, prompts, prosody_engine, recording_engine, session_scorer
+from lib.audio_io import AudioDecodeError
 from lib.prisma_client import db
 from lib.session_scorer import AudioFeatures, ScoredSession
+from lib.speech_config import load_speech_config
 from middlewares.auth_middleware import require_auth
 from schemas.public_speaking_schemas import (
     PublicSpeakingScorecard,
@@ -270,19 +274,22 @@ async def get_session(session_id: str, user_id: str) -> Dict:
 
 
 async def _process_audio(audio_data: str) -> Tuple[str, Optional[AudioFeatures]]:
-    """Process audio input: decode, transcribe, extract features"""
+    """Process audio input: decode base64, then run it through the same shared
+    decode+VAD+STT+prosody pipeline Pronunciation Coach / Accent Assessment use
+    (lib/recording_engine.py) instead of duplicating that logic here."""
     try:
-        # Decode base64 audio
-        audio_bytes = audio_io.decode_base64_audio(audio_data)
-        
-        # Extract audio features (duration, volume, etc.)
-        audio_features = audio_io.extract_audio_features(audio_bytes)
-        
-        # Transcribe using STT
-        transcript = await stt_engine.transcribe(audio_bytes)
-        
-        return transcript, audio_features
-    except Exception as e:
+        # Frontend sends either a raw base64 string or a data: URI — strip the prefix if present.
+        raw = audio_data.split(",", 1)[1] if audio_data.startswith("data:") else audio_data
+        audio_bytes = base64.b64decode(raw)
+        config = load_speech_config()
+        analysis = recording_engine.analyze_recording(audio_bytes, config)
+        audio_features = AudioFeatures(
+            transcript=analysis.transcript,
+            duration_seconds=analysis.duration_seconds,
+            avg_db=analysis.avg_dbfs,
+        )
+        return analysis.transcript, audio_features
+    except (AudioDecodeError, binascii.Error) as e:
         logger.error(f"Audio processing failed: {e}")
         return "", None
 
@@ -523,8 +530,10 @@ def _analyze_voice_clarity(audio_features: Optional[AudioFeatures]) -> Dict:
         })
         clarity_score = 50.0
     
-    # Check for volume consistency
-    if audio_features.db_variance and audio_features.db_variance > 15:
+    # Check for volume consistency (not currently produced by the recording pipeline —
+    # guarded rather than assumed present since AudioFeatures doesn't declare this field).
+    db_variance = getattr(audio_features, "db_variance", None)
+    if db_variance and db_variance > 15:
         issues.append({
             "type": "volume_inconsistent",
             "message": "Voice volume varies significantly. Try to maintain consistent projection.",

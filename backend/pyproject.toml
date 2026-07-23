@@ -36,9 +36,8 @@ dependencies = [
 
 [tool.taskipy.tasks]
 dev = "uvicorn main:app --reload"
-dev-all = "uvicorn main:app --reload --host 0.0.0.0 --port 8000"
-dev-full = "python scripts/dev_all.py"
 start = "uvicorn main:app"
+start-all = "uvicorn main:app --reload --host 0.0.0.0 --port 8000"
 
 prisma-generate = "prisma generate"
 prisma-migrate = "prisma migrate dev"

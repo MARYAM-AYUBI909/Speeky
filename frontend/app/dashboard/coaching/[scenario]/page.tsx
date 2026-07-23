@@ -2,13 +2,14 @@
 
 import * as React from "react";
 import { useParams, useRouter } from "next/navigation";
-import { CheckCircle2, Sparkles, TriangleAlert } from "lucide-react";
+import { CheckCircle2, Mic, MicOff, Sparkles, TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ApiError } from "@/lib/api";
 import {
   getCoachingScenarios,
+  getCoachingVoiceToken,
   sendRoleplayTurn,
   startCoachingSession,
   submitCoachingSession,
@@ -17,6 +18,7 @@ import {
   type StartCoachingResult,
 } from "@/lib/coaching";
 import { useAutoScroll } from "@/lib/useAutoScroll";
+import { useLiveKitVoice } from "@/lib/useLiveKitVoice";
 import { useSpeechRecognition } from "@/lib/useSpeechRecognition";
 
 interface ChatTurn {
@@ -52,6 +54,32 @@ export default function CoachingSessionPage() {
   const voiceStartedAt = React.useRef<number | null>(null);
   const { isSupported: isSpeechSupported, isListening, error: speechError, start, stop } =
     useSpeechRecognition();
+
+  // Voice mode for the roleplay chat turns only (draft submission keeps the browser
+  // dictation above — it's a one-shot monologue, not a back-and-forth). Same LiveKit
+  // mic-in pattern as Conversation/Scenarios: transcript fills chatInput, never auto-sent.
+  const roleplaySessionIdRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (step.name === "roleplay") roleplaySessionIdRef.current = step.session.session_id;
+  }, [step]);
+  const fetchVoiceToken = React.useCallback(() => {
+    if (!roleplaySessionIdRef.current) return Promise.reject(new Error("No active session"));
+    return getCoachingVoiceToken(roleplaySessionIdRef.current);
+  }, []);
+  const onTranscript = React.useCallback((text: string) => {
+    setChatInput((prev) => (prev.trim() ? `${prev.trim()} ${text}` : text));
+  }, []);
+  const {
+    isVoiceActive,
+    isConnectingVoice,
+    voiceStatus: liveVoiceStatus,
+    error: voiceError,
+    startVoice,
+    stopVoice,
+  } = useLiveKitVoice(fetchVoiceToken, onTranscript);
+  React.useEffect(() => {
+    if (voiceError) setError(voiceError);
+  }, [voiceError]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -171,6 +199,7 @@ export default function CoachingSessionPage() {
 
   async function handleEndRoleplay() {
     if (step.name !== "roleplay") return;
+    if (isVoiceActive) await stopVoice();
     setError(null);
     setIsSubmitting(true);
     try {
@@ -345,8 +374,29 @@ export default function CoachingSessionPage() {
               >
                 Send
               </Button>
+              {isVoiceActive ? (
+                <Button size="md" variant="outline" onClick={() => void stopVoice()}>
+                  <MicOff className="h-4 w-4" aria-hidden="true" />
+                  Stop Voice
+                </Button>
+              ) : (
+                <Button
+                  size="md"
+                  variant="outline"
+                  loading={isConnectingVoice}
+                  onClick={() => void startVoice()}
+                >
+                  <Mic className="h-4 w-4" aria-hidden="true" />
+                  Start Voice
+                </Button>
+              )}
             </div>
           )}
+          {liveVoiceStatus ? (
+            <p role="status" aria-live="polite" className="text-sm text-muted-foreground">
+              {liveVoiceStatus}
+            </p>
+          ) : null}
           {error ? <p className="text-sm text-danger">{error}</p> : null}
         </div>
       </div>

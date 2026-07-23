@@ -46,11 +46,34 @@ export default function AssessmentPage() {
   const [answer, setAnswer] = React.useState("");
   const [isSubmitting, setIsSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+
+  // Decide the initial step exactly once. refresh() (called after finishing
+  // the assessment) toggles accessLoading true->false again, which would
+  // otherwise re-run this and clobber the "results" step with
+  // "already-assessed" right after the user finishes — see hasInitialized.
+  const hasInitialized = React.useRef(false);
+  React.useEffect(() => {
+    if (accessLoading || hasInitialized.current) return;
+    hasInitialized.current = true;
+    if (
+      access?.assessment_status === "COMPLETED" ||
+      access?.assessment_status === "PLATEAUED"
+    ) {
+      setStep({ name: "already-assessed" });
+    } else {
+      setStep({ name: "intro" });
+    }
+  }, [accessLoading, access]);
   const [voiceStatus, setVoiceStatus] = React.useState("");
   const voiceStartedAt = React.useRef<number | null>(null);
   const voiceAnswerUsed = React.useRef(false);
-  const { isSupported: isSpeechSupported, isListening, error: speechError, start, stop } =
-    useSpeechRecognition();
+  const {
+    isSupported: isSpeechSupported,
+    isListening,
+    error: speechError,
+    start,
+    stop,
+  } = useSpeechRecognition();
 
   async function handleStart() {
     setError(null);
@@ -110,7 +133,10 @@ export default function AssessmentPage() {
           step.questionMode === "audio" && voiceAnswerUsed.current
             ? {
                 duration_seconds: voiceStartedAt.current
-                  ? Math.max(0, (performance.now() - voiceStartedAt.current) / 1000)
+                  ? Math.max(
+                      0,
+                      (performance.now() - voiceStartedAt.current) / 1000,
+                    )
                   : 0,
               }
             : undefined,
@@ -139,7 +165,12 @@ export default function AssessmentPage() {
   }
 
   function handleStartVoice() {
-    if (step.name !== "question" || step.questionMode !== "audio" || isListening) return;
+    if (
+      step.name !== "question" ||
+      step.questionMode !== "audio" ||
+      isListening
+    )
+      return;
     voiceStartedAt.current = performance.now();
     voiceAnswerUsed.current = true;
     setVoiceStatus("Listening...");
@@ -362,8 +393,12 @@ export default function AssessmentPage() {
               </p>
             </div>
           ) : null}
-          {speechError ? <p className="mt-2 text-sm text-danger">{speechError}</p> : null}
-          {voiceStatus ? <p className="mt-2 text-sm text-muted-foreground">{voiceStatus}</p> : null}
+          {speechError ? (
+            <p className="mt-2 text-sm text-danger">{speechError}</p>
+          ) : null}
+          {voiceStatus ? (
+            <p className="mt-2 text-sm text-muted-foreground">{voiceStatus}</p>
+          ) : null}
           {error ? <p className="mt-3 text-sm text-danger">{error}</p> : null}
           <Button
             size="lg"

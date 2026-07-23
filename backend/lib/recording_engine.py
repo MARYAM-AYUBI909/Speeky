@@ -26,6 +26,8 @@ class RejectionReason(str, Enum):
     INCOMPLETE_RECORDING = "incomplete_recording"
     MULTIPLE_VOICES_DETECTED = "multiple_voices_detected"
     PLAYBACK_DETECTED = "playback_detected"
+    AUDIO_DISTORTION = "audio_distortion"
+
 
 
 
@@ -64,13 +66,19 @@ def analyze_recording(audio_bytes: bytes, config: SpeechConfig) -> RecordingAnal
     prosody = prosody_engine.analyze(waveform, sample_rate)
     multiple_voices = prosody_engine.detect_multiple_voices(prosody, config)
 
+    import numpy as np
+    clipping_ratio = float(np.sum(np.abs(waveform) > 0.98)) / max(1, len(waveform))
+
     rejection: Optional[RejectionReason] = None
-    if not vad_result.has_speech:
+    if clipping_ratio > 0.02:
+        rejection = RejectionReason.AUDIO_DISTORTION
+    elif not vad_result.has_speech:
         rejection = RejectionReason.NO_SPEECH_DETECTED
     elif avg_dbfs < config.min_avg_dbfs:
         rejection = RejectionReason.AUDIO_TOO_QUIET
     elif snr_db < config.min_snr_db:
         rejection = RejectionReason.BACKGROUND_NOISE_TOO_HIGH
+
 
     transcript, words = "", []
     if rejection is None:

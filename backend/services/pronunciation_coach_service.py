@@ -5,17 +5,19 @@ adds only the word-status classification, scoring, and persistence that are spec
 to this feature.
 """
 
+import base64
 import json
 import logging
 import random
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from fastapi import Depends, File, Form, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from prisma import Json
 
-from lib import prosody_engine, recording_engine, text_alignment
+from lib import kv_store, prosody_engine, recording_engine, text_alignment, tts_client
 from lib.audio_io import AudioDecodeError
 from lib.prisma_client import db
 from lib.recording_engine import RejectionReason
@@ -28,7 +30,12 @@ from schemas.pronunciation_schemas import (
     TargetSentenceSchema,
     WordResultSchema,
 )
-from utils.feature_errors import SentenceNotFoundError, UnreadableAudioError, UploadTooLargeError
+from utils.feature_errors import (
+    InvalidSubmissionError,
+    SentenceNotFoundError,
+    UnreadableAudioError,
+    UploadTooLargeError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +45,10 @@ _STATUS_POINTS = {
     WordStatus.MISPRONOUNCED: 30.0,
     WordStatus.SKIPPED: 0.0,
 }
+
+# ── PRN-US-10 / PRN-US-11: "hear correct pronunciation" playback ────────────────
+_TTS_CACHE_NS = "pronunciation_tts_cache"
+_VALID_SPEEDS = ("normal", "slow")
 
 
 class SentenceBank:
@@ -181,6 +192,59 @@ async def submit_pronunciation_attempt(
         disfluency_detected=disfluency_detected,
         accent_profile=accent_profile_tag,
     )
+
+
+def _tts_cache_key(word: str, speed: str) -> str:
+    return f"{word.strip().lower()}::{speed}"
+
+
+async def _get_cached_audio(word: str, speed: str, ttl_seconds: int) -> Optional[bytes]:
+    entry = await kv_store.store.get(_TTS_CACHE_NS, _tts_cache_key(word, speed))
+    if entry is None:
+        return None
+    cached_at: datetime = entry["cached_at"]
+    age = (datetime.now(timezone.utc) - cached_at).total_seconds()
+    if age > ttl_seconds:
+        return None
+    return base64.b64decode(entry["audio_b64"])
+
+
+async def _store_cached_audio(word: str, speed: str, audio: bytes) -> None:
+    key = _tts_cache_key(word, speed)
+    value = {"audio_b64": base64.b64encode(audio).decode("ascii"), "cached_at": datetime.now(timezone.utc)}
+    if await kv_store.store.get(_TTS_CACHE_NS, key) is None:
+        await kv_store.store.create(_TTS_CACHE_NS, key, value)
+    else:
+        await kv_store.store.update(_TTS_CACHE_NS, key, value)
+
+
+async def get_word_pronunciation_audio(word: str, speed: str = "normal", user_id: str = Depends(require_auth)):
+    """Correct-pronunciation playback for a single word/short phrase — fires when the
+    user taps a mispronounced word (PRN-US-10, speed=normal) or when the retry loop
+    hits PRN-US-11's E-01 exception and offers a slow breakdown instead (speed=slow).
+    `word` is reused as-is from a WordResultSchema.word the client already has; no
+    server-side retry-streak tracking is added here, that stays a frontend concern."""
+    if speed not in _VALID_SPEEDS:
+        raise InvalidSubmissionError(f"speed must be one of {_VALID_SPEEDS}")
+
+    config = load_speech_config()
+    cached = await _get_cached_audio(word, speed, config.pronunciation_tts_cache_ttl_seconds)
+    if cached is not None:
+        return Response(content=cached, media_type="audio/wav")
+
+    if not tts_client.is_configured():
+        return JSONResponse(status_code=503, content={
+            "error": "TTS engine unavailable. Fall back to your device's native text-to-speech.",
+        })
+
+    length_scale = 1.0 if speed == "normal" else config.pronunciation_tts_slow_length_scale
+    try:
+        audio = tts_client.synthesize(word, length_scale=length_scale)
+    except tts_client.TTSError as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+
+    await _store_cached_audio(word, speed, audio)
+    return Response(content=audio, media_type="audio/wav")
 
 
 def _rejection_message(reason: RejectionReason) -> str:

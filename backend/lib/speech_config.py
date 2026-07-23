@@ -76,6 +76,10 @@ class SpeechConfig:
     # ── Accent Profile & Improvement (US-89) ──────────────────────────────────
     exercise_batch_size: int
 
+    # ── Pronunciation Coach TTS playback (PRN-US-10 / PRN-US-11) ──────────────
+    pronunciation_tts_slow_length_scale: float
+    pronunciation_tts_cache_ttl_seconds: int
+
 
 def load_speech_config() -> SpeechConfig:
     return SpeechConfig(
@@ -101,9 +105,18 @@ def load_speech_config() -> SpeechConfig:
         rhythm_max_acceptable_cv=_float_env("RHYTHM_MAX_ACCEPTABLE_CV", 2.0),
         intonation_ideal_range_min_semitones=_float_env("INTONATION_IDEAL_RANGE_MIN_SEMITONES", 3.0),
         intonation_ideal_range_max_semitones=_float_env("INTONATION_IDEAL_RANGE_MAX_SEMITONES", 12.0),
-        multi_voice_pitch_jump_semitones=_float_env("MULTI_VOICE_PITCH_JUMP_SEMITONES", 7.0),
+        # 20.0 (not the original 7.0): measured against real clean single-voice readings,
+        # a single speaker's own natural pitch resets at sentence/phrase boundaries hit
+        # 12-16 semitones on longer passages -- 7.0 flagged effectively all of them as
+        # "multiple voices". No threshold can perfectly separate that from a genuine second
+        # voice (a mismatched-pitch overlay measured as low as ~11 semitones in testing), so
+        # this trades missing some multi-voice interference for not blocking every legitimate
+        # single-voice submission -- the single-voice false positive is the more costly failure.
+        multi_voice_pitch_jump_semitones=_float_env("MULTI_VOICE_PITCH_JUMP_SEMITONES", 20.0),
         multi_voice_min_voiced_segments=_int_env("MULTI_VOICE_MIN_VOICED_SEGMENTS", 4),
         multi_voice_min_run_seconds=_float_env("MULTI_VOICE_MIN_RUN_SECONDS", 0.06),
         default_accent_profile=_str_env("DEFAULT_ACCENT_PROFILE", "neutral"),
         exercise_batch_size=_int_env("EXERCISE_BATCH_SIZE", 6),
+        pronunciation_tts_slow_length_scale=_float_env("PRONUNCIATION_TTS_SLOW_LENGTH_SCALE", 1.6),
+        pronunciation_tts_cache_ttl_seconds=_int_env("PRONUNCIATION_TTS_CACHE_TTL_SECONDS", 604800),
     )

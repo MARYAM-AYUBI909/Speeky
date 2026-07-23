@@ -1,29 +1,32 @@
-"""
-Speeky AI - LiveKit Speech-to-Text Worker
+"""LiveKit worker for AI Conversation Practice's voice mode.
 
-Pipeline:
-LiveKit audio
-    -> Silero VAD
-    -> Faster-Whisper
-    -> FastAPI conversation backend
+Room-naming contract: the LiveKit room name IS the conversation session_id
+(see conversation_service._start_session: session["room_name"] = session_id,
+and livekit_tokens.mint_room_token(session["room_name"], ...) — the frontend
+joins that exact room with the token from POST /conversation/sessions/{id}/voice-token).
 
-The LiveKit room name is the conversation session ID (conv_...).
+This worker auto-dispatches to every room a participant joins (default LiveKit
+agent dispatch — no per-session launch needed). For each subscribed audio track
+it runs Silero VAD to find speech segments, transcribes each segment locally
+with faster-whisper, and sends results over the room's LiveKit data channel:
 
-The worker listens to microphone tracks, detects complete speech
-utterances with Silero VAD, transcribes them using Faster-Whisper,
-and sends valid transcripts to the backend.
+    topic="voice_transcript", payload={"text": "..."}   — final transcript
+    topic="voice_status",     payload={"status": "speaking"|"idle"}  — live state
 
-Run:
-    python agent.py dev
+The frontend (see ConversationSessionPage's RoomEvent.DataReceived handler)
+appends transcript text into the message input box — the user reviews/edits it
+and hits Send, reusing the existing POST /conversation/sessions/{id}/messages
+path. The status packets drive a pulsing mic dot so the user sees when speech
+is being detected. This worker never calls the backend directly and never
+auto-sends on the user's behalf.
 """
 
 import asyncio
+import json
 import logging
-import os
-import tempfile
-import wave
+from concurrent.futures import ThreadPoolExecutor
 
-import httpx
+import numpy as np
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
 from livekit import rtc
@@ -36,405 +39,100 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice-agent")
 
+model = WhisperModel("base", device="cpu", compute_type="int8")
 
-BACKEND_URL = os.environ.get(
-    "BACKEND_URL",
-    "http://localhost:8000",
-)
-
-INTERNAL_AGENT_SECRET = os.environ["INTERNAL_AGENT_SECRET"]
-
-
-# Very short segments are commonly clicks, microphone noise,
-# screen-reader leakage, or incomplete speech.
-MIN_UTTERANCE_SECONDS = 0.5
+# model.transcribe() is synchronous/CPU-bound; run it off the event loop so it never
+# blocks the agent's WebRTC keepalives (a blocked loop for the several seconds
+# transcription takes was tipping the LiveKit connection into a client-initiated
+# disconnect mid-session). max_workers=1 also serializes calls onto one shared model
+# instance, which isn't guaranteed safe for concurrent inference.
+_executor = ThreadPoolExecutor(max_workers=1)
 
 
-logger.info("Loading Faster-Whisper model...")
-
-model = WhisperModel(
-    "small.en",
-    device="cpu",
-    compute_type="int8",
-)
-
-logger.info("Faster-Whisper model loaded.")
+def frames_to_float32(frames: list[rtc.AudioFrame]) -> np.ndarray:
+    """Concatenate VAD speech-segment frames (int16 PCM) into one float32 array."""
+    chunks = [np.frombuffer(f.data, dtype=np.int16) for f in frames]
+    return np.concatenate(chunks).astype(np.float32) / 32768.0
 
 
-def save_temp_wav(frames):
-    """
-    Save one utterance to its own temporary WAV file.
-
-    A unique temporary file prevents different users or overlapping
-    utterances from overwriting the same speech.wav file.
-    """
-
-    first = frames[0]
-
-    temp_file = tempfile.NamedTemporaryFile(
-        suffix=".wav",
-        delete=False,
-    )
-
-    filename = temp_file.name
-    temp_file.close()
-
-    with wave.open(filename, "wb") as wav:
-        wav.setnchannels(first.num_channels)
-        wav.setsampwidth(2)
-        wav.setframerate(first.sample_rate)
-
-        for frame in frames:
-            wav.writeframes(frame.data)
-
-    return filename
+def transcribe(audio: np.ndarray) -> str:
+    # temperature=0: single decode pass. faster-whisper's default temperature-fallback
+    # ladder retries up to 6x on low-confidence audio, turning one utterance into a
+    # 7-10s+ block — the user reviews/edits the transcript before sending anyway, so a
+    # rougher single-pass result beats a more "accurate" one that misses the latency budget.
+    segments, _info = model.transcribe(audio, beam_size=5, temperature=0)
+    return " ".join(seg.text.strip() for seg in segments).strip()
 
 
-def transcribe_audio(filename):
-    """
-    Transcribe one utterance.
-
-    Returns:
-        transcript
-        word_timings
-    """
-
-    segments, _info = model.transcribe(
-        filename,
-        language="en",
-        beam_size=5,
-        word_timestamps=True,
-        condition_on_previous_text=False,
-        vad_filter=False,
-    )
-
-    text_parts = []
-    word_timings = []
-
-    for segment in segments:
-        text = segment.text.strip()
-
-        if text:
-            text_parts.append(text)
-
-        for word in segment.words or []:
-            cleaned_word = word.word.strip()
-
-            if cleaned_word:
-                word_timings.append(
-                    {
-                        "word": cleaned_word,
-                        "start": word.start,
-                        "end": word.end,
-                    }
-                )
-
-    transcript = " ".join(text_parts).strip()
-
-    return transcript, word_timings
-
-
-async def send_transcript_to_backend(
-    session_id,
-    transcript,
-    word_timings,
-    duration_seconds,
-):
-    """
-    Send a successfully recognized utterance to the conversation backend.
-    """
-
-    payload = {
-        "input_mode": "audio",
-        "audio_features": {
-            "transcript": transcript,
-            "duration_seconds": duration_seconds,
-            "word_timings": word_timings,
-        },
-    }
-
-    url = (
-        f"{BACKEND_URL}/api/conversation/internal/"
-        f"sessions/{session_id}/agent-message"
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                url,
-                json=payload,
-                headers={
-                    "X-Internal-Secret": INTERNAL_AGENT_SECRET
-                },
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-            logger.info(
-                "Transcript delivered successfully for session %s",
-                session_id,
-            )
-
-            logger.info(
-                "Backend reply: %s",
-                data.get("reply"),
-            )
-
-    except httpx.HTTPError:
-        logger.exception(
-            "Failed to deliver transcript for session %s",
-            session_id,
-        )
-
-
-async def process_utterance(
-    frames,
-    identity,
-    session_id,
-):
-    """
-    Process one complete speech utterance independently.
-
-    Whisper runs in a worker thread so CPU-heavy transcription does not
-    block LiveKit's asyncio event loop.
-    """
-
-    if not frames:
+async def publish_transcript(room: rtc.Room, text: str) -> None:
+    if not text:
         return
-
-    sample_rate = frames[0].sample_rate
-    logger.info(
-        "Audio received (%s): sample_rate=%d channels=%d frames=%d",
-        identity,
-        sample_rate,
-        frames[0].num_channels,
-        len(frames),
-    )
-
-    total_samples = sum(
-        frame.samples_per_channel
-        for frame in frames
-    )
-
-    duration_seconds = total_samples / sample_rate
-
-    logger.info(
-        "Utterance duration (%s): %.2f seconds",
-        identity,
-        duration_seconds,
-    )
-
-    if duration_seconds < MIN_UTTERANCE_SECONDS:
-        logger.info(
-            "Utterance too short (%s) - not sent to Whisper",
-            identity,
-        )
-        return
-
-    filename = None
-
+    payload = json.dumps({"text": text}).encode("utf-8")
     try:
-        filename = save_temp_wav(frames)
-
-        logger.info(
-            "Starting Whisper transcription (%s)",
-            identity,
-        )
-
-        transcript, word_timings = await asyncio.to_thread(
-            transcribe_audio,
-            filename,
-        )
-
-        if not transcript:
-            logger.info(
-                "Whisper returned no usable speech (%s) - skipping",
-                identity,
-            )
-            return
-
-        logger.info(
-            "TRANSCRIPT (%s): %s",
-            identity,
-            transcript,
-        )
-
-        logger.info(
-            "Sending transcript to backend for session %s",
-            session_id,
-        )
-
-        await send_transcript_to_backend(
-            session_id,
-            transcript,
-            word_timings,
-            duration_seconds,
-        )
-
+        await room.local_participant.publish_data(payload, reliable=True, topic="voice_transcript")
+        logger.info("Sent transcript to frontend: %r", text)
     except Exception:
-        logger.exception(
-            "Failed to process utterance for %s",
-            identity,
-        )
-
-    finally:
-        if filename and os.path.exists(filename):
-            try:
-                os.remove(filename)
-            except OSError:
-                logger.warning(
-                    "Could not remove temporary audio file",
-                )
+        logger.exception("Failed to publish transcript over data channel")
 
 
-async def process_audio(
-    track,
-    identity,
-    vad,
-    session_id,
-):
-    """
-    Continuously feed one participant's LiveKit audio into Silero VAD.
-    """
+async def publish_status(room: rtc.Room, status: str) -> None:
+    """Send a speaking/idle hint so the frontend can show a live mic indicator."""
+    payload = json.dumps({"status": status}).encode("utf-8")
+    try:
+        await room.local_participant.publish_data(payload, reliable=False, topic="voice_status")
+    except Exception:
+        pass  # best-effort — status hints are non-critical
 
+
+async def process_audio(track: rtc.Track, identity: str, vad: silero.VAD, room: rtc.Room):
     audio_stream = rtc.AudioStream(track)
     vad_stream = vad.stream()
 
-    utterance_tasks = set()
-
     async def forward_frames():
-        try:
-            async for event in audio_stream:
-                vad_stream.push_frame(event.frame)
-
-        finally:
-            vad_stream.end_input()
+        async for event in audio_stream:
+            vad_stream.push_frame(event.frame)
+        vad_stream.end_input()
 
     async def read_vad_events():
         async for event in vad_stream:
-
             if event.type == agents_vad.VADEventType.START_OF_SPEECH:
-
-                logger.info(
-                    "Speech STARTED (%s)",
-                    identity,
-                )
-
+                logger.info("Speech STARTED (%s)", identity)
+                await publish_status(room, "speaking")
             elif event.type == agents_vad.VADEventType.END_OF_SPEECH:
+                await publish_status(room, "idle")
+                audio = frames_to_float32(event.frames)
+                text = await asyncio.get_running_loop().run_in_executor(_executor, transcribe, audio)
+                logger.info("Speech ENDED (%s): %r", identity, text)
+                await publish_transcript(room, text)
 
-                logger.info(
-                    "Speech ENDED (%s)",
-                    identity,
-                )
-
-                task = asyncio.create_task(
-                    process_utterance(
-                        event.frames,
-                        identity,
-                        session_id,
-                    )
-                )
-
-                utterance_tasks.add(task)
-
-                task.add_done_callback(
-                    utterance_tasks.discard
-                )
-
-    try:
-        await asyncio.gather(
-            forward_frames(),
-            read_vad_events(),
-        )
-
-    except asyncio.CancelledError:
-        logger.info(
-            "Audio processing stopped for %s",
-            identity,
-        )
-        raise
+    await asyncio.gather(forward_frames(), read_vad_events())
 
 
 async def entrypoint(ctx: JobContext):
-
     await ctx.connect()
-
-    session_id = ctx.room.name
-
-    logger.info(
-        "Agent connected to room: %s",
-        session_id,
-    )
-
-    logger.info(
-        "Loading Silero VAD model..."
-    )
+    logger.info("Connected to room: %s", ctx.room.name)
 
     vad = silero.VAD.load()
 
-    logger.info(
-        "Silero VAD model loaded."
-    )
-
-    audio_tasks = set()
-
     @ctx.room.on("track_subscribed")
-    def on_track_subscribed(
-        track,
-        publication,
-        participant,
-    ):
-
-        logger.info(
-            "Track subscribed: kind=%s participant=%s",
-            track.kind,
-            participant.identity,
-        )
-
+    def on_track_subscribed(track: rtc.Track, publication, participant):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
+            logger.info("Subscribed to audio from %s", participant.identity)
+            asyncio.create_task(process_audio(track, participant.identity, vad, ctx.room))
 
-            task = asyncio.create_task(
-                process_audio(
-                    track,
-                    participant.identity,
-                    vad,
-                    session_id,
+    # Drain tracks that were already published before this worker joined.
+    # track_subscribed only fires for future subscriptions — without this loop
+    # any mic the browser published before the agent connected is silently missed.
+    for participant in ctx.room.remote_participants.values():
+        for publication in participant.track_publications.values():
+            if publication.track and publication.track.kind == rtc.TrackKind.KIND_AUDIO:
+                logger.info("Processing pre-existing audio from %s", participant.identity)
+                asyncio.create_task(
+                    process_audio(publication.track, participant.identity, vad, ctx.room)
                 )
-            )
 
-            audio_tasks.add(task)
-
-            task.add_done_callback(
-                audio_tasks.discard
-            )
-
-    try:
-        await asyncio.Event().wait()
-
-    except asyncio.CancelledError:
-        logger.info(
-            "LiveKit job ending for session %s",
-            session_id,
-        )
-
-        for task in audio_tasks:
-            task.cancel()
-
-        if audio_tasks:
-            await asyncio.gather(
-                *audio_tasks,
-                return_exceptions=True,
-            )
-
-        raise
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint
-        )
-    )
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

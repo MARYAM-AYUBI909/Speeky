@@ -29,21 +29,35 @@ from fastapi import Depends, Response
 from fastapi.responses import JSONResponse
 from prisma import Json
 
-from lib import llm_client, prompts
+from lib import livekit_tokens, llm_client, prompts
 from lib.prisma_client import db
 from middlewares.auth_middleware import require_admin, require_auth
-from schemas.scenario_schemas import CustomScenarioSchema, ScenarioTurnSchema, StartScenarioSchema
+from schemas.scenario_schemas import (
+    CustomScenarioSchema,
+    ScenarioPreviewSchema,
+    ScenarioTurnSchema,
+    StartScenarioSchema,
+)
 from services.coaching_service import _AGGRESSIVE, _find_phrases
 
 logger = logging.getLogger(__name__)
 
 # Exception-handling thresholds
-SILENCE_MIN_CHARS = 3       # shorter than this ⇒ treated as "didn't really answer"
-RAMBLING_WORD_COUNT = 150   # longer than this ⇒ flagged as rambling
+SILENCE_MIN_CHARS = 3        # shorter than this ⇒ treated as "didn't really answer"
+RAMBLING_WORD_COUNT = 150    # longer than this ⇒ flagged as rambling
+SILENCE_STREAK_LIMIT = 3     # 2 nudges, then the 3rd consecutive silent/idle turn auto-closes
+AGGRESSION_STREAK_LIMIT = 2  # 1 warning, then the 2nd consecutive aggressive/cursing turn ends it
 
 _EMERGENCY_PHRASES = [
     "heart attack", "can't breathe", "cannot breathe", "i'm dying", "im dying",
     "chest pain", "call an ambulance", "emergency", "suicidal", "kill myself",
+]
+
+# _AGGRESSIVE catches accusatory phrasing ("you failed", "unacceptable");
+# it has no actual swear words, so cursing needs its own bank.
+_PROFANITY = [
+    "fuck", "fucking", "shit", "bullshit", "bitch", "asshole", "bastard", "damn you",
+    "screw you", "piss off", "shut the hell up", "go to hell", "moron", "prick", "scumbag", "ass"
 ]
 
 _POLITE_MARKERS = ["please", "could i", "could you", "would you mind", "thank you", "thanks"]
@@ -63,7 +77,8 @@ def _classify_turn(scenario_meta: Dict, message: str) -> str:
         return "emergency"
     if len(text) < SILENCE_MIN_CHARS:
         return "silence"
-    if _find_phrases(f" {text.lower()} ", _AGGRESSIVE):
+    lowered = f" {text.lower()} "
+    if _find_phrases(lowered, _AGGRESSIVE) or _find_phrases(lowered, _PROFANITY):
         return "aggressive"
     if len(text.split()) > RAMBLING_WORD_COUNT:
         return "rambling"
@@ -206,21 +221,37 @@ _EMERGENCY_REPLY = (
     "This session has been paused for your safety."
 )
 
+_SILENCE_AUTO_CLOSE_REPLY = (
+    "It looks like you've stepped away, so I'll close this session here — your progress up to "
+    "this point has been saved. Feel free to start a new scenario anytime."
+)
+
+_AGGRESSION_AUTO_CLOSE_REPLY = (
+    "I did ask you to keep this respectful, and that hasn't happened, so I'm ending this practice "
+    "session here. Your progress up to this point has been saved."
+)
+
 
 async def _roleplay_reply(meta: Dict, turns: List[Dict], classification: str) -> str:
     if classification == "emergency":
         return _EMERGENCY_REPLY
     if classification == "silence":
-        return "Sorry, I didn't quite catch that — could you say a bit more?"
-    if classification == "aggressive":
-        return "I don't think we can continue this conversation on that tone. Let's stop here."
+        return "Sorry, I didn't quite catch that — It looks like we may have lost you for a moment so whenever you're ready, go ahead and continue."
 
     if not llm_client.is_configured():
+        if classification == "aggressive":
+            return "That tone isn't necessary here — let's keep this respectful, please."
         if classification == "rambling":
             return "Okay — could you sum that up in a sentence or two?"
         return meta["opening_fallback"]
 
     system = prompts.build_scenario_roleplay_prompt(meta)
+    if classification == "aggressive":
+        # First/only warning — the caller (send_turn) decides when the streak limit is hit and
+        # ends the session outright without calling this at all (see _AGGRESSION_AUTO_CLOSE_REPLY).
+        system += ("\n\nThe user was rude, cursed, or aggressive. In character, react realistically: "
+                   "show real displeasure and firmly ask them to be respectful, but don't end the "
+                   "conversation yet — give them one more chance.")
     if classification == "rambling":
         system += "\n\nThe user's last message was long-winded. In character, politely ask them to summarize."
     messages = [{"role": "system", "content": system}] + [
@@ -246,6 +277,21 @@ async def _require_access(user_id: str) -> Optional[JSONResponse]:
 
 async def get_scenarios(user_id: str = Depends(require_auth)):
     return {"scenarios": await list_scenarios()}
+
+
+# ── Voice mode: LiveKit room token (mirrors conversation_service._voice_token) ─
+async def voice_token(session_id: str, user_id: str = Depends(require_auth)):
+    gate = await _require_access(user_id)
+    if gate:
+        return gate
+    session = await db.scenariosession.find_unique(where={"id": session_id})
+    if not session or session.userId != user_id:
+        return JSONResponse(status_code=404, content={"error": "Scenario session not found"})
+    if not livekit_tokens.is_configured():
+        return JSONResponse(status_code=503, content={
+            "error": "Voice mode unavailable. Use text mode instead.",
+        })
+    return livekit_tokens.mint_room_token(session_id, identity=user_id)
 
 
 async def get_scenario_detail(key: str, user_id: str = Depends(require_auth)):
@@ -284,6 +330,43 @@ async def start_session(payload: StartScenarioSchema, user_id: str = Depends(req
     }
 
 
+async def _finalize_session(session_id: str, meta: Dict, target_vocab: List[str],
+                            turns: List[Dict], status: str) -> Dict:
+    """Grade + persist a session as done — shared by end_session (explicit) and
+    send_turn's silence auto-close (SBL-US-01 E-03: 'AI prompts twice, then gently
+    auto-closes the scenario saving progress')."""
+    coverage = _vocab_coverage(turns, target_vocab)
+    grade = await grade_session(meta, turns, coverage["used"])
+    vocabulary_score = round(100 * len(coverage["used"]) / max(1, len(target_vocab)), 2)
+    confidence = round((grade["politeness"] + vocabulary_score) / 2, 2)
+
+    await db.scenariosession.update(
+        where={"id": session_id},
+        data={
+            "turns": Json(turns),
+            "status": status,
+            "vocabUsed": coverage["used"],
+            "politenessScore": grade["politeness"],
+            "vocabularyScore": vocabulary_score,
+            "confidenceScore": confidence,
+            "metGoal": grade["met_goal"],
+            "summary": grade["summary"],
+            "completedAt": datetime.now(timezone.utc),
+        },
+    )
+    return {
+        "session_id": session_id,
+        "status": status,
+        "scores": {"politeness": grade["politeness"], "vocabulary": vocabulary_score, "confidence": confidence},
+        "vocab_used": coverage["used"],
+        "vocab_missing": coverage["missing"],
+        "met_goal": grade["met_goal"] if meta.get("goal_type") == "negotiation" else None,
+        "summary": grade["summary"],
+        "suggestion": grade["suggestion"],
+        "graded_by": grade["_source"],
+    }
+
+
 async def send_turn(session_id: str, payload: ScenarioTurnSchema, user_id: str = Depends(require_auth)):
     session = await db.scenariosession.find_unique(where={"id": session_id})
     if not session or session.userId != user_id:
@@ -297,15 +380,44 @@ async def send_turn(session_id: str, payload: ScenarioTurnSchema, user_id: str =
 
     turns = list(session.turns) + [{"role": "user", "content": payload.message}]
     classification = _classify_turn(meta, payload.message)
+    silence_streak = session.silenceStreak + 1 if classification == "silence" else 0
+    aggression_streak = session.aggressionStreak + 1 if classification == "aggressive" else 0
+
+    # (The frontend fires an empty turn after IDLE_TIMEOUT_SECONDS of inactivity, so this
+    # also covers "stayed in the session but never spoke or typed", not just short replies.)
+    if classification == "silence" and silence_streak >= SILENCE_STREAK_LIMIT:
+        turns.append({"role": "assistant", "content": _SILENCE_AUTO_CLOSE_REPLY})
+        await _finalize_session(session_id, meta, session.targetVocab, turns, "completed")
+        return {
+            "session_id": session_id,
+            "reply": _SILENCE_AUTO_CLOSE_REPLY,
+            "status": "completed",
+            "classification": "silence",
+        }
+
+    # One warning for aggression/cursing, then the scenario ends on the next offense —
+    # graduated, matching how a real person would react, not an instant kill on turn one.
+    if classification == "aggressive" and aggression_streak >= AGGRESSION_STREAK_LIMIT:
+        turns.append({"role": "assistant", "content": _AGGRESSION_AUTO_CLOSE_REPLY})
+        await _finalize_session(session_id, meta, session.targetVocab, turns, "ended_early")
+        return {
+            "session_id": session_id,
+            "reply": _AGGRESSION_AUTO_CLOSE_REPLY,
+            "status": "ended_early",
+            "classification": "aggressive",
+        }
+
     reply = await _roleplay_reply(meta, turns, classification)
     turns.append({"role": "assistant", "content": reply})
 
-    new_status = "in_progress"
-    if classification in ("aggressive", "emergency"):
-        new_status = "ended_early"
+    new_status = "ended_early" if classification == "emergency" else "in_progress"
 
     await db.scenariosession.update(
-        where={"id": session_id}, data={"turns": Json(turns), "status": new_status}
+        where={"id": session_id},
+        data={
+            "turns": Json(turns), "status": new_status,
+            "silenceStreak": silence_streak, "aggressionStreak": aggression_streak,
+        },
     )
     return {
         "session_id": session_id,
@@ -323,41 +435,8 @@ async def end_session(session_id: str, user_id: str = Depends(require_auth)):
         return JSONResponse(status_code=400, content={"error": "Session already completed"})
 
     meta = await scenario_meta(session.scenarioKey)
-    turns = list(session.turns)
-    coverage = _vocab_coverage(turns, session.targetVocab)
-    grade = await grade_session(meta, turns, coverage["used"])
-
     final_status = session.status if session.status == "ended_early" else "completed"
-    vocabulary_score = round(100 * len(coverage["used"]) / max(1, len(session.targetVocab)), 2)
-
-    await db.scenariosession.update(
-        where={"id": session_id},
-        data={
-            "status": final_status,
-            "vocabUsed": coverage["used"],
-            "politenessScore": grade["politeness"],
-            "vocabularyScore": vocabulary_score,
-            "confidenceScore": round((grade["politeness"] + vocabulary_score) / 2, 2),
-            "metGoal": grade["met_goal"],
-            "summary": grade["summary"],
-            "completedAt": datetime.now(timezone.utc),
-        },
-    )
-    return {
-        "session_id": session_id,
-        "status": final_status,
-        "scores": {
-            "politeness": grade["politeness"],
-            "vocabulary": vocabulary_score,
-            "confidence": round((grade["politeness"] + vocabulary_score) / 2, 2),
-        },
-        "vocab_used": coverage["used"],
-        "vocab_missing": coverage["missing"],
-        "met_goal": grade["met_goal"] if meta and meta.get("goal_type") == "negotiation" else None,
-        "summary": grade["summary"],
-        "suggestion": grade["suggestion"],
-        "graded_by": grade["_source"],
-    }
+    return await _finalize_session(session_id, meta, session.targetVocab, list(session.turns), final_status)
 
 
 async def get_session(session_id: str, user_id: str = Depends(require_auth)):
@@ -450,6 +529,30 @@ async def admin_update_custom(scenario_id: str, payload: CustomScenarioSchema, u
         },
     )
     return _serialize_custom(updated)
+
+
+async def admin_preview_custom(payload: ScenarioPreviewSchema, user_id: str = Depends(require_admin)):
+    meta = {
+        "label": "Preview",
+        "persona": payload.persona,
+        "intent": "",
+        "goal_type": payload.goal_type,
+        "safety_mode": payload.safety_mode,
+        "corporate_tone": payload.corporate_tone,
+        "target_vocab": payload.target_vocab or ["(none set)"],
+        "opening_fallback": payload.opening_line or f"Let's begin — {payload.persona}.",
+        "instructions": payload.system_prompt,
+    }
+    turns = [t.model_dump() for t in payload.turns]
+
+    if not payload.message:
+        opening = await _roleplay_opening("preview", meta)
+        return {"reply": opening, "classification": "ok"}
+
+    turns.append({"role": "user", "content": payload.message})
+    classification = _classify_turn(meta, payload.message)
+    reply = await _roleplay_reply(meta, turns, classification)
+    return {"reply": reply, "classification": classification}
 
 
 async def admin_delete_custom(scenario_id: str, user_id: str = Depends(require_admin)):

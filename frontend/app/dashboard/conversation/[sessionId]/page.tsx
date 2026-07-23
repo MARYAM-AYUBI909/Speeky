@@ -2,7 +2,14 @@
 
 import * as React from "react";
 import { useParams, useRouter } from "next/navigation";
-import { CheckCircle2, Headphones, Mic, MicOff, PhoneOff, Volume2 } from "lucide-react";
+import {
+  CheckCircle2,
+  Headphones,
+  Mic,
+  MicOff,
+  PhoneOff,
+  Volume2,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ApiError } from "@/lib/api";
 import {
@@ -15,13 +22,7 @@ import {
 } from "@/lib/conversation";
 import { playText } from "@/lib/tts";
 import { useAutoScroll } from "@/lib/useAutoScroll";
-import {
-  Room,
-  RoomEvent,
-  Track,
-  createLocalAudioTrack,
-  type LocalAudioTrack,
-} from "livekit-client";
+import { useLiveKitVoice } from "@/lib/useLiveKitVoice";
 
 export default function ConversationSessionPage() {
   const params = useParams<{ sessionId: string }>();
@@ -34,16 +35,32 @@ export default function ConversationSessionPage() {
   const [error, setError] = React.useState<string | null>(null);
   const [playingIndex, setPlayingIndex] = React.useState<number | null>(null);
   const [audioMode, setAudioMode] = React.useState(false);
-  const [summary, setSummary] = React.useState<EndConversationResult | null>(null);
-  const [isVoiceActive, setIsVoiceActive] = React.useState(false);
-  const [isConnectingVoice, setIsConnectingVoice] = React.useState(false);
-  const [voiceStatus, setVoiceStatus] = React.useState("");
+  const [summary, setSummary] = React.useState<EndConversationResult | null>(
+    null,
+  );
 
   const scrollRef = useAutoScroll(turns?.length ?? 0);
   const lastAutoPlayed = React.useRef(-1);
   const audioModeWasOn = React.useRef(false);
-  const roomRef = React.useRef<Room | null>(null);
-  const microphoneTrackRef = React.useRef<LocalAudioTrack | null>(null);
+
+  // voice_agent transcribes speech and sends it back over the LiveKit data channel
+  // (topic "voice_transcript") instead of auto-sending — fills the input box so the
+  // user can review/edit before hitting Send.
+  const fetchVoiceToken = React.useCallback(
+    () => getConversationVoiceToken(params.sessionId),
+    [params.sessionId],
+  );
+  const onTranscript = React.useCallback((text: string) => {
+    setMessage((prev) => (prev.trim() ? `${prev.trim()} ${text}` : text));
+  }, []);
+  const {
+    isVoiceActive,
+    isConnectingVoice,
+    voiceStatus,
+    error: voiceError,
+    startVoice,
+    stopVoice,
+  } = useLiveKitVoice(fetchVoiceToken, onTranscript);
 
   React.useEffect(() => {
     getConversationTranscript(params.sessionId)
@@ -52,10 +69,16 @@ export default function ConversationSessionPage() {
         setTopicLabel(data.topic_label);
       })
       .catch((err) =>
-        setError(err instanceof ApiError ? err.message : "Couldn't load this session.")
+        setError(
+          err instanceof ApiError ? err.message : "Couldn't load this session.",
+        ),
       );
   }, [params.sessionId]);
 
+  // Audio mode: auto-speak each new assistant turn as it arrives. Also
+  // re-speak the current last turn right when audioMode flips back on —
+  // otherwise the "already played" guard silently blocks it and toggling
+  // off/on again looks broken.
   const refreshTranscript = React.useCallback(async () => {
     try {
       const data = await getConversationTranscript(params.sessionId);
@@ -80,114 +103,32 @@ export default function ConversationSessionPage() {
       audioModeWasOn.current = audioMode;
       return;
     }
-
     const turnedOn = !audioModeWasOn.current;
     audioModeWasOn.current = true;
-
     const lastIndex = turns.length - 1;
     const last = turns[lastIndex];
-    if (last.role === "assistant" && (turnedOn || lastAutoPlayed.current !== lastIndex)) {
+    if (
+      last.role === "assistant" &&
+      (turnedOn || lastAutoPlayed.current !== lastIndex)
+    ) {
       lastAutoPlayed.current = lastIndex;
       void handlePlay(lastIndex, last.content);
     }
   }, [audioMode, turns, handlePlay]);
 
   React.useEffect(() => {
-    if (!isVoiceActive) return;
-
-    const interval = window.setInterval(() => {
-      void refreshTranscript();
-    }, 1500);
-
-    return () => {
-      window.clearInterval(interval);
-    };
-  }, [isVoiceActive, refreshTranscript]);
+    if (voiceError) setError(voiceError);
+  }, [voiceError]);
 
   async function handleStartVoice() {
-    if (isVoiceActive || isConnectingVoice) return;
-
     setError(null);
-    setIsConnectingVoice(true);
-    setVoiceStatus("Connecting voice...");
-
-    try {
-      const voiceData = await getConversationVoiceToken(params.sessionId);
-      const room = new Room();
-
-      room.on(RoomEvent.Disconnected, () => {
-        setIsVoiceActive(false);
-        setVoiceStatus("Voice disconnected.");
-      });
-
-      await room.connect(voiceData.url, voiceData.token);
-
-      const microphoneTrack = await createLocalAudioTrack();
-      await room.localParticipant.publishTrack(microphoneTrack, {
-        source: Track.Source.Microphone,
-      });
-
-      roomRef.current = room;
-      microphoneTrackRef.current = microphoneTrack;
-
-      setIsVoiceActive(true);
-      setVoiceStatus("Voice connected. Microphone is active.");
-    } catch (err) {
-      console.error("Failed to start voice:", err);
-
-      microphoneTrackRef.current?.stop();
-      microphoneTrackRef.current = null;
-
-      if (roomRef.current) {
-        await roomRef.current.disconnect();
-        roomRef.current = null;
-      }
-
-      setIsVoiceActive(false);
-      setVoiceStatus("Could not start voice.");
-      setError(
-        err instanceof ApiError
-          ? err.message
-          : "Couldn't connect to voice mode. Check microphone permission and try again."
-      );
-    } finally {
-      setIsConnectingVoice(false);
-    }
+    await startVoice();
   }
 
   async function handleStopVoice() {
-    setVoiceStatus("Stopping voice...");
-
-    try {
-      if (microphoneTrackRef.current) {
-        microphoneTrackRef.current.stop();
-        microphoneTrackRef.current = null;
-      }
-
-      if (roomRef.current) {
-        await roomRef.current.disconnect();
-        roomRef.current = null;
-      }
-    } finally {
-      setIsVoiceActive(false);
-      setVoiceStatus("Voice stopped.");
-      await refreshTranscript();
-    }
+    await stopVoice();
+    await refreshTranscript();
   }
-
-  React.useEffect(() => {
-    return () => {
-      microphoneTrackRef.current?.stop();
-      microphoneTrackRef.current = null;
-
-      const room = roomRef.current;
-      roomRef.current = null;
-
-      if (room) {
-        void room.disconnect();
-      }
-    };
-  }, []);
 
   async function handleSend() {
     if (!message.trim() || isSending) return;
@@ -198,14 +139,26 @@ export default function ConversationSessionPage() {
     setMessage("");
     setTurns((prev) => [
       ...(prev ?? []),
-      { role: "user", content: text, input_mode: "text", correction_chip: null, created_at: "" },
+      {
+        role: "user",
+        content: text,
+        input_mode: "text",
+        correction_chip: null,
+        created_at: "",
+      },
     ]);
 
     try {
       const result = await sendConversationMessage(params.sessionId, { text });
       setTurns((prev) => [
         ...(prev ?? []),
-        { role: "assistant", content: result.reply, input_mode: null, correction_chip: null, created_at: "" },
+        {
+          role: "assistant",
+          content: result.reply,
+          input_mode: null,
+          correction_chip: null,
+          created_at: "",
+        },
       ]);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong.");
@@ -236,7 +189,9 @@ export default function ConversationSessionPage() {
       <div className="mx-auto flex max-w-xl flex-col gap-6">
         <div className="animate-fade-up rounded-2xl border border-border bg-gradient-to-br from-primary to-primary-hover p-8 text-center text-primary-foreground shadow-sm">
           <CheckCircle2 className="mx-auto h-6 w-6" aria-hidden="true" />
-          <h1 className="mt-3 font-serif text-2xl font-semibold">Session Complete</h1>
+          <h1 className="mt-3 font-serif text-2xl font-semibold">
+            Session Complete
+          </h1>
           <p className="mt-2 text-sm text-primary-foreground/85">
             {Math.round(summary.duration_seconds)}s · Level: {summary.level}
           </p>
@@ -265,7 +220,9 @@ export default function ConversationSessionPage() {
         </div>
         {summary.new_memory_facts.length > 0 ? (
           <div className="rounded-2xl border border-border bg-surface-elevated p-6 shadow-sm">
-            <p className="text-sm font-medium text-foreground">Speeky remembered</p>
+            <p className="text-sm font-medium text-foreground">
+              Speeky remembered
+            </p>
             <ul className="mt-2 flex flex-col gap-1 text-sm text-muted-foreground">
               {summary.new_memory_facts.map((fact, i) => (
                 <li key={i}>
@@ -298,8 +255,14 @@ export default function ConversationSessionPage() {
             type="button"
             onClick={() => setAudioMode((v) => !v)}
             aria-pressed={audioMode}
-            aria-label={audioMode ? "Turn off audio mode" : "Turn on audio mode"}
-            title={audioMode ? "Audio mode on - replies are spoken automatically" : "Turn on audio mode"}
+            aria-label={
+              audioMode ? "Turn off audio mode" : "Turn on audio mode"
+            }
+            title={
+              audioMode
+                ? "Audio mode on - replies are spoken automatically"
+                : "Turn on audio mode"
+            }
             className={
               "flex h-9 w-9 items-center justify-center rounded-xl border transition-colors " +
               (audioMode
@@ -309,7 +272,12 @@ export default function ConversationSessionPage() {
           >
             <Headphones className="h-4 w-4" aria-hidden="true" />
           </button>
-          <Button size="sm" variant="outline" loading={isEnding} onClick={handleEnd}>
+          <Button
+            size="sm"
+            variant="outline"
+            loading={isEnding}
+            onClick={handleEnd}
+          >
             <PhoneOff className="h-4 w-4" aria-hidden="true" />
             End Session
           </Button>
@@ -317,9 +285,17 @@ export default function ConversationSessionPage() {
       </div>
 
       <div className="flex flex-col gap-4 rounded-2xl border border-border bg-surface-elevated p-6 shadow-sm">
-        <div ref={scrollRef} className="flex max-h-[55vh] flex-col gap-4 overflow-y-auto">
+        <div
+          ref={scrollRef}
+          className="flex max-h-[55vh] flex-col gap-4 overflow-y-auto"
+        >
           {(turns ?? []).map((turn, i) => (
-            <div key={i} className={turn.role === "user" ? "ml-auto max-w-[80%]" : "max-w-[80%]"}>
+            <div
+              key={i}
+              className={
+                turn.role === "user" ? "ml-auto max-w-[80%]" : "max-w-[80%]"
+              }
+            >
               <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                 {turn.role === "user" ? "You" : "Coach"}
               </span>
@@ -345,8 +321,12 @@ export default function ConversationSessionPage() {
               </div>
               {turn.correction_chip ? (
                 <div className="mt-1.5 rounded-lg bg-warning/10 px-3 py-2 text-xs text-foreground">
-                  <span className="line-through opacity-70">{turn.correction_chip.original}</span>{" "}
-                  <span className="font-medium text-success">{turn.correction_chip.corrected}</span>
+                  <span className="line-through opacity-70">
+                    {turn.correction_chip.original}
+                  </span>{" "}
+                  <span className="font-medium text-success">
+                    {turn.correction_chip.corrected}
+                  </span>
                   <p className="mt-0.5 text-muted-foreground">
                     {turn.correction_chip.explanation}
                   </p>
@@ -372,12 +352,21 @@ export default function ConversationSessionPage() {
             placeholder="Type a message..."
             className="h-11 flex-1 rounded-xl border border-input bg-surface px-4 text-sm text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none focus:ring-2 focus:ring-ring/40"
           />
-          <Button size="md" loading={isSending} disabled={!message.trim()} onClick={() => void handleSend()}>
+          <Button
+            size="md"
+            loading={isSending}
+            disabled={!message.trim()}
+            onClick={() => void handleSend()}
+          >
             Send
           </Button>
 
           {isVoiceActive ? (
-            <Button size="md" variant="outline" onClick={() => void handleStopVoice()}>
+            <Button
+              size="md"
+              variant="outline"
+              onClick={() => void handleStopVoice()}
+            >
               <MicOff className="h-4 w-4" aria-hidden="true" />
               Stop Voice
             </Button>
@@ -395,7 +384,11 @@ export default function ConversationSessionPage() {
         </div>
 
         {voiceStatus ? (
-          <p role="status" aria-live="polite" className="text-sm text-muted-foreground">
+          <p
+            role="status"
+            aria-live="polite"
+            className="text-sm text-muted-foreground"
+          >
             {voiceStatus}
           </p>
         ) : null}

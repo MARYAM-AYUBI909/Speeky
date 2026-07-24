@@ -35,3 +35,9 @@ export interface FillerWordAnalysisResponse {
 export function getPublicSpeakingFillerWords(sessionId: string) {
   return api<FillerWordAnalysisResponse>(`/public-speaking/${sessionId}/filler-words`);
 }
+
+// GET /api/interview-coach/sessions/{session_id}/filler-words
+// Route from: backend/routers/interview_coach_routes.py
+export function getInterviewCoachFillerWords(sessionId: string) {
+  return api<FillerWordAnalysisResponse>(`/interview-coach/sessions/${sessionId}/filler-words`);
+}

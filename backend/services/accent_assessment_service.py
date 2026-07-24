@@ -47,6 +47,7 @@ _REJECTION_TO_STATUS = {
     RejectionReason.INCOMPLETE_RECORDING: AccentAssessmentStatus.REJECTED_INCOMPLETE,
     RejectionReason.MULTIPLE_VOICES_DETECTED: AccentAssessmentStatus.REJECTED_MULTIPLE_VOICES,
     RejectionReason.PLAYBACK_DETECTED: AccentAssessmentStatus.REJECTED_NO_SPEECH,
+    RejectionReason.AUDIO_DISTORTION: AccentAssessmentStatus.REJECTED_DISTORTION,
 }
 
 _REJECTION_MESSAGES = {
@@ -56,6 +57,7 @@ _REJECTION_MESSAGES = {
     RejectionReason.INCOMPLETE_RECORDING: "The reading appears incomplete — please read the entire passage in one take.",
     RejectionReason.MULTIPLE_VOICES_DETECTED: "Multiple voices were detected in the recording. Please record alone in a quiet space.",
     RejectionReason.PLAYBACK_DETECTED: "Detected playback audio. Live speech required for accent assessment.",
+    RejectionReason.AUDIO_DISTORTION: "Audio distortion detected. Please move farther from the microphone and try again.",
 }
 
 
@@ -81,6 +83,22 @@ class PassageBank:
 
 
 _passage_bank = PassageBank()
+
+_MONTH_CYCLE_DAYS = 30
+
+
+async def _compute_month_index(user_id: str) -> int:
+    """Same 30-day-cycle rule as accent_progress_service._next_month_index, so rows
+    written here slot into the month columns the Accent Progress Tracker (ACC-US-12)
+    expects instead of colliding on a single hardcoded value."""
+    first = await db.accentassessment.find_first(
+        where={"userId": user_id, "status": AccentAssessmentStatus.COMPLETED},
+        order={"completedAt": "asc"},
+    )
+    if not first or not first.completedAt:
+        return 1
+    days_since = (datetime.now(timezone.utc) - first.completedAt).days
+    return days_since // _MONTH_CYCLE_DAYS + 1
 
 
 async def get_target_passage(
@@ -256,7 +274,10 @@ async def submit_passage_assessment(
     if not valid_token:
         return JSONResponse(
             status_code=422,
-            content={"error": "Stale, missing, or reused prompt session token. Please fetch a fresh passage."},
+            content=RecordingRejectedSchema(
+                reason="stale_prompt_token",
+                message="Stale, missing, or reused prompt session token. Please fetch a fresh passage.",
+            ).model_dump(),
         )
 
     passage = _passage_bank.get_by_id(passage_id)
@@ -293,8 +314,17 @@ async def submit_passage_assessment(
             ).model_dump(),
         )
 
-    # ACC-US-11 E-01: Check for extreme dialect distortion breakdown
-    has_breakdown, breakdown_warning, clarity_fallback = accent_calibration_service.handle_stt_breakdown_fallback(analysis)
+    # ACC-US-11 E-01: Check for extreme dialect distortion breakdown. Only meaningful
+    # when analyze_recording's own checks passed (rejection is None) but STT still came
+    # back empty -- if analysis.rejection is already set (no speech/too quiet/too
+    # noisy/distortion), transcript/words are guaranteed empty by construction, which
+    # would always satisfy this function's guard and wrongly suppress that rejection's
+    # specific 422 in favor of a fallback-scored 200. Skip the call entirely in that
+    # case so the rejection below fires normally.
+    if analysis.rejection is None:
+        has_breakdown, breakdown_warning, clarity_fallback = accent_calibration_service.handle_stt_breakdown_fallback(analysis)
+    else:
+        has_breakdown, breakdown_warning, clarity_fallback = False, None, 0.0
 
     aligned_words, coverage = recording_engine.align_to_passage(analysis, passage["text"], config)
 
@@ -312,6 +342,8 @@ async def submit_passage_assessment(
             data={
                 "userId": user_id,
                 "passageId": passage_id,
+                "monthIndex": await _compute_month_index(user_id),
+                "wordStressScore": 0.0,
                 "status": _REJECTION_TO_STATUS[rejection],
                 "rejectionReason": rejection.value,
                 "transcript": analysis.transcript or None,
@@ -355,10 +387,12 @@ async def submit_passage_assessment(
         data={
             "userId": user_id,
             "passageId": passage_id,
+            "monthIndex": await _compute_month_index(user_id),
             "status": AccentAssessmentStatus.COMPLETED,
             "transcript": analysis.transcript or "Phonetic clarity fallback",
             "pronunciationScore": pronunciation_score,
             "stressScore": stress_score,
+            "wordStressScore": stress_score,
             "rhythmScore": rhythm_score,
             "intonationScore": intonation_score,
             "clarityScore": clarity_score,

@@ -43,6 +43,7 @@ ACTIONABLE_FILLER_TIP = (
 )
 
 FILLER_WORD_NS = "filler_word_sessions"
+INTERVIEW_COACH_NS = "interview_coach_sessions"
 
 
 async def _is_db_connected() -> bool:
@@ -279,6 +280,7 @@ async def get_filler_words_for_session(
             if ps_session and ps_session.userId == user_id:
                 transcript = ps_session.transcript
                 speech_type = ps_session.speechType
+                audio_features = ps_session.audioFeatures
         except Exception as e:
             logger.warning(f"PublicSpeakingSession DB lookup error: {e}")
 
@@ -316,6 +318,35 @@ async def get_filler_words_for_session(
     analysis = analyze_filler_words(
         text=transcript,
         audio_features=audio_features,
+        session_id=session_id,
+        speech_type=speech_type,
+    )
+    return analysis.model_dump()
+
+
+async def get_filler_words_for_interview_session(
+    session_id: str,
+    user_id: str = Depends(require_auth),
+) -> Dict:
+    """
+    API handler for GET /interview-coach/sessions/{session_id}/filler-words (US-102).
+    Mock Interview has no separate audio-features pipeline of its own — sessions are a
+    text Q&A exchange (interview_coach_service.py's kv_store-backed session dict), so
+    the candidate's answer transcript is built from that session's exchanges and run
+    through the same analyze_filler_words() Public Speaking uses.
+    """
+    session = await kv_store.store.get(INTERVIEW_COACH_NS, session_id)
+    if not session or not isinstance(session, dict) or session.get("user_id") != user_id:
+        raise SessionNotFoundError(f"Session '{session_id}' not found")
+
+    candidate_text = " ".join(
+        e["answer"] for e in session.get("exchanges", []) if e.get("answer")
+    )
+    mode = session.get("mode")
+    speech_type = mode.value if hasattr(mode, "value") else (str(mode) if mode else "interview")
+
+    analysis = analyze_filler_words(
+        text=candidate_text,
         session_id=session_id,
         speech_type=speech_type,
     )

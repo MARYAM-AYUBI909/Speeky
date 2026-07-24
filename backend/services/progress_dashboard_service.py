@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 from fastapi import Depends
 from fastapi.responses import JSONResponse
+from prisma import Json
 
 from lib import kv_store
 from lib.prisma_client import db
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 DASHBOARD_SNAPSHOT_NS = "dashboard_snapshots"
 MAX_DAILY_VOCAB_GROWTH = 15
 
-DAY1_MOTIVATIONAL_PROMPT = "Complete your first session or Daily Challenge to see your progress growth!"
+DAY1_MOTIVATIONAL_PROMPT = "Complete your first session to see your progress growth!"
 SYNC_STALE_MESSAGE = "Syncing recent data... Unable to reach server, showing last-known-good metrics."
 
 
@@ -63,6 +64,28 @@ def _validate_score(score: Optional[float]) -> Tuple[Optional[float], bool]:
         return round(val, 2), False
     except (ValueError, TypeError):
         return None, True
+
+
+async def _flag_outlier_row(prisma_model, row_id: str, flag_field: str, offending_fields: List[str]) -> None:
+    """
+    E-03 (continued): actually persists the outlier flag onto the source row instead of
+    only counting it in-memory, so the flagged session is visible for review later
+    (appends rather than overwrites, since a row could be flagged more than once).
+    """
+    try:
+        current = await prisma_model.find_unique(where={"id": row_id})
+        if not current:
+            return
+        existing = list(getattr(current, flag_field) or [])
+        existing.append({
+            "type": "outlier_score",
+            "fields": offending_fields,
+            "flagged_at": datetime.now(timezone.utc).isoformat(),
+            "note": "Score outside the valid 0-100 range; dropped from progress dashboard aggregates.",
+        })
+        await prisma_model.update(where={"id": row_id}, data={flag_field: Json(existing)})
+    except Exception as e:
+        logger.warning(f"Failed to persist outlier flag ({flag_field}) on row {row_id}: {e}")
 
 
 def calculate_rolling_streak(records: List[Dict]) -> int:
@@ -135,6 +158,11 @@ async def _fetch_completed_records_from_db(user_id: str) -> Tuple[List[Dict], in
             p_score, o4 = _validate_score(b.pronunciationScore)
             if any([o1, o2, o3, o4]):
                 outliers_count += 1
+                offending = [f for f, flagged in [
+                    ("vocabulary_score", o1), ("confidence_score", o2),
+                    ("fluency_score", o3), ("pronunciation_score", o4),
+                ] if flagged]
+                await _flag_outlier_row(db.baselineassessment, b.id, "outlierFlags", offending)
 
             dur = (b.completedAt - b.startedAt).total_seconds() if b.startedAt and b.completedAt else 60.0
             records.append({
@@ -161,6 +189,11 @@ async def _fetch_completed_records_from_db(user_id: str) -> Tuple[List[Dict], in
             p_score, o4 = _validate_score(c.pronunciationScore)
             if any([o1, o2, o3, o4]):
                 outliers_count += 1
+                offending = [f for f, flagged in [
+                    ("vocabulary_score", o1), ("confidence_score", o2),
+                    ("fluency_score", o3), ("pronunciation_score", o4),
+                ] if flagged]
+                await _flag_outlier_row(db.coachingsession, c.id, "flags", offending)
 
             dur = (c.completedAt - c.createdAt).total_seconds() if c.createdAt and c.completedAt else 60.0
             records.append({
@@ -185,6 +218,10 @@ async def _fetch_completed_records_from_db(user_id: str) -> Tuple[List[Dict], in
             c_score, o2 = _validate_score(s.confidenceScore)
             if any([o1, o2]):
                 outliers_count += 1
+                offending = [f for f, flagged in [
+                    ("vocabulary_score", o1), ("confidence_score", o2),
+                ] if flagged]
+                await _flag_outlier_row(db.scenariosession, s.id, "flags", offending)
 
             dur = (s.completedAt - s.createdAt).total_seconds() if s.createdAt and s.completedAt else 60.0
             records.append({
@@ -215,6 +252,10 @@ async def _fetch_completed_records_from_db(user_id: str) -> Tuple[List[Dict], in
             p_score, o3 = _validate_score(raw_clarity)
             if any([o1, o2, o3]):
                 outliers_count += 1
+                offending = [f for f, flagged in [
+                    ("confidence_score", o1), ("fluency_score", o2), ("pronunciation_score", o3),
+                ] if flagged]
+                await _flag_outlier_row(db.publicspeakingsession, ps.id, "outlierFlags", offending)
 
             dur = (ps.completedAt - ps.createdAt).total_seconds() if ps.createdAt and ps.completedAt else 60.0
             records.append({
@@ -409,8 +450,14 @@ async def get_progress_dashboard(user_id: str = Depends(require_auth)) -> Dict:
         vocab_growth = await _fetch_vocab_growth_count(user_id)
         payload = _build_dashboard_payload(user_id, db_records, outliers_count, vocab_growth)
 
-        # E-01: Save last-known-good snapshot to KV store
-        await kv_store.store.create(DASHBOARD_SNAPSHOT_NS, user_id, payload)
+        # E-01: Save last-known-good snapshot to KV store. create() fails with a
+        # unique-constraint violation once a snapshot row already exists for this
+        # user, so update the existing row instead of always creating.
+        existing_snapshot = await kv_store.store.get(DASHBOARD_SNAPSHOT_NS, user_id)
+        if existing_snapshot is None:
+            await kv_store.store.create(DASHBOARD_SNAPSHOT_NS, user_id, payload)
+        else:
+            await kv_store.store.update(DASHBOARD_SNAPSHOT_NS, user_id, payload)
         return payload
 
     except Exception as exc:

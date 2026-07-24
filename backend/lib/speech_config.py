@@ -84,6 +84,7 @@ class SpeechConfig:
     liveness_min_noise_floor_dbfs: float
     liveness_token_ttl_seconds: int
     local_accent_model_available: bool
+    liveness_min_high_freq_energy_ratio: float
 
 
 
@@ -128,5 +129,12 @@ def load_speech_config() -> SpeechConfig:
         liveness_min_noise_floor_dbfs=_float_env("LIVENESS_MIN_NOISE_FLOOR_DBFS", -75.0),
         liveness_token_ttl_seconds=_int_env("LIVENESS_TOKEN_TTL_SECONDS", 900),
         local_accent_model_available=_str_env("LOCAL_ACCENT_MODEL_AVAILABLE", "true").lower() in ("true", "1", "yes"),
+        # Fraction of total spectral energy expected in the top 10% of the Nyquist band
+        # (7200Hz-8000Hz at the default 16kHz sample rate). Lossy speech codecs and
+        # multi-generation playback/re-recording commonly low-pass well below Nyquist;
+        # genuine live mic capture keeps a small but nonzero tail up there from sibilance
+        # and room/mic noise even in a quiet room. Best-effort proxy, not real codec
+        # artifact detection -- see recording_engine._high_freq_energy_ratio.
+        liveness_min_high_freq_energy_ratio=_float_env("LIVENESS_MIN_HIGH_FREQ_ENERGY_RATIO", 0.0005),
     )
 

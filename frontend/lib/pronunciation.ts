@@ -1,35 +1,36 @@
-import { api } from "./api";
+import { api, API_URL, ApiError } from "./api";
 
 // ── Pronunciation Coach API (prefix: /api/pronunciation-coach) ──────────────
+// Mirrors backend/schemas/pronunciation_schemas.py response shapes exactly.
 
 export interface TargetSentenceResponse {
   sentence_id: string;
-  sentence: string;
+  difficulty: string;
+  text: string;
+  focus_sounds: string[];
   prompt_token: string;
-  difficulty?: string;
-  category?: string;
 }
 
 export interface WordResult {
   word: string;
+  target_index: number;
   status: "correct" | "stress_error" | "mispronounced" | "skipped";
-  confidence?: number;
+  confidence?: number | null;
 }
 
 export interface PronunciationAssessResult {
-  session_id: string;
+  attempt_id: string;
   sentence_id: string;
+  target_text: string;
+  transcript: string;
   overall_score: number;
   word_results: WordResult[];
+  attempt_count: number;
+  background_voice_detected: boolean;
+  disfluency_detected: boolean;
+  accent_profile?: string | null;
   warning?: string | null;
-  pacing_tip?: string | null;
-  calibrated_for_local_accent?: boolean;
-}
-
-export interface PronunciationTtsResponse {
-  audio_base64: string;
-  mime_type: string;
-  speed: "normal" | "slow";
+  model_used?: string | null;
 }
 
 // GET /api/pronunciation-coach/sentences
@@ -45,7 +46,20 @@ export function assessPronunciation(formData: FormData) {
   });
 }
 
-// GET /api/pronunciation-coach/words/{word}/audio?speed=normal|slow
-export function fetchPronunciationTts(word: string, speed: "normal" | "slow" = "normal") {
-  return api<PronunciationTtsResponse>(`/pronunciation-coach/words/${encodeURIComponent(word)}/audio?speed=${speed}`);
+// GET /api/pronunciation-coach/words/{word}/audio?speed=normal|slow — returns a
+// raw audio/wav body on success (not JSON), so this fetches manually rather
+// than through the api() JSON helper (mirrors lib/conversation.ts's synthesizeSpeech).
+export async function fetchPronunciationTts(
+  word: string,
+  speed: "normal" | "slow" = "normal"
+): Promise<Blob> {
+  const response = await fetch(
+    `${API_URL}/pronunciation-coach/words/${encodeURIComponent(word)}/audio?speed=${speed}`,
+    { credentials: "include" }
+  );
+  if (!response.ok) {
+    const data = await response.json().catch(() => null);
+    throw new ApiError(data?.error ?? "Correct pronunciation audio unavailable", response.status, data);
+  }
+  return response.blob();
 }

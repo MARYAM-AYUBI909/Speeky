@@ -18,10 +18,12 @@ import binascii
 import logging
 import re
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import Depends
+from prisma import Json
 from lib import llm_client, prompts, prosody_engine, recording_engine, session_scorer
 from lib.audio_io import AudioDecodeError
 from lib.prisma_client import db
@@ -138,7 +140,7 @@ async def submit_turn(
     if not session or session.userId != user_id:
         raise ValueError("Session not found")
     
-    speech_config = SPEECH_TYPES.get(session.speechType, SPEECH_TYPES[PublicSpeakingType.BUSINESS_PITCH])
+    speech_config = SPEECH_TYPES.get(session.speechType, SPEECH_TYPES["business_pitch"])
     
     # Process audio or text input
     if turn.audio_data:
@@ -165,7 +167,8 @@ async def submit_turn(
             "transcript": text_content,
             "status": "completed" if turn.is_final else "in_progress",
             "completedAt": datetime.now(timezone.utc) if turn.is_final else None,
-            "scorecard": scorecard,
+            "scorecard": Json(scorecard),
+            "audioFeatures": _audio_features_json(audio_features),
         }
     )
     
@@ -236,7 +239,7 @@ async def submit_qa_response(
             "userQaResponse": text_content,
             "status": "completed",
             "completedAt": datetime.now(timezone.utc),
-            "qaScore": qa_score,
+            "qaScore": Json(qa_score),
         }
     )
     
@@ -273,6 +276,13 @@ async def get_session(session_id: str, user_id: str) -> Dict:
     }
 
 
+def _audio_features_json(audio_features: Optional[AudioFeatures]):
+    """Serializes AudioFeatures (incl. real per-word timings) for the audioFeatures
+    Json column, so get_filler_words_for_session can read real timestamps back out
+    instead of falling back to synthetic evenly-spaced ones."""
+    return Json(asdict(audio_features)) if audio_features else None
+
+
 async def _process_audio(audio_data: str) -> Tuple[str, Optional[AudioFeatures]]:
     """Process audio input: decode base64, then run it through the same shared
     decode+VAD+STT+prosody pipeline Pronunciation Coach / Accent Assessment use
@@ -287,6 +297,13 @@ async def _process_audio(audio_data: str) -> Tuple[str, Optional[AudioFeatures]]
             transcript=analysis.transcript,
             duration_seconds=analysis.duration_seconds,
             avg_db=analysis.avg_dbfs,
+            # PSC-US-08: real per-word STT timestamps, not the filler-word service's
+            # synthetic evenly-spaced fallback — lets "Um: 12 times" markers land on
+            # the actual moment each filler word was spoken.
+            word_timings=[
+                {"word": w.word, "start": w.start, "end": w.end, "confidence": w.probability}
+                for w in analysis.words
+            ],
         )
         return analysis.transcript, audio_features
     except (AudioDecodeError, binascii.Error) as e:

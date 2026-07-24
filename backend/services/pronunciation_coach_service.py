@@ -67,8 +67,12 @@ class SentenceBank:
     def all(self) -> List[dict]:
         return self._all
 
-    def random(self, difficulty: Optional[str] = None) -> dict:
+    def random(self, difficulty: Optional[str] = None, exclude_id: Optional[str] = None) -> dict:
         pool = [s for s in self._all if s["difficulty"] == difficulty] if difficulty else self._all
+        if exclude_id and len(pool) > 1:
+            filtered = [s for s in pool if s["sentence_id"] != exclude_id]
+            if filtered:
+                pool = filtered
         return random.choice(pool or self._all)
 
 
@@ -190,10 +194,14 @@ async def submit_pronunciation_attempt(
             ).model_dump(),
         )
 
-    # ACC-US-11 E-01: Check STT breakdown fallback
-    has_breakdown, breakdown_warning, clarity_fallback = accent_calibration_service.handle_stt_breakdown_fallback(analysis)
-
-    if analysis.rejection is not None and not has_breakdown:
+    # A rejection here means analyze_recording() already skipped STT entirely for a
+    # known reason (no speech / too quiet / too noisy / distortion) -- transcript and
+    # words are guaranteed empty by construction, which would always satisfy
+    # handle_stt_breakdown_fallback's guard below. Must return the specific rejection
+    # message here, before that call, or these always get mistaken for the different
+    # "STT itself failed on otherwise-clean audio" case and silently fall through to a
+    # fallback-scored 200 instead of their required 422.
+    if analysis.rejection is not None:
         return JSONResponse(
             status_code=422,
             content=RecordingRejectedSchema(
@@ -201,6 +209,11 @@ async def submit_pronunciation_attempt(
                 message=_rejection_message(analysis.rejection),
             ).model_dump(),
         )
+
+    # ACC-US-11 E-01: rejection is None (analyze_recording's own checks passed), but
+    # STT may still have produced nothing -- the genuine extreme-dialect-distortion
+    # breakdown case this fallback exists for.
+    has_breakdown, breakdown_warning, clarity_fallback = accent_calibration_service.handle_stt_breakdown_fallback(analysis)
 
     if isinstance(accent_profile, str):
         user_pref, sub_pref = accent_profile, None
@@ -327,4 +340,5 @@ def _rejection_message(reason: RejectionReason) -> str:
         RejectionReason.BACKGROUND_NOISE_TOO_HIGH: "Background noise is too high to analyze. Please try again in a quieter environment.",
         RejectionReason.INCOMPLETE_RECORDING: "The recording appears to be incomplete.",
         RejectionReason.MULTIPLE_VOICES_DETECTED: "Multiple voices were detected in the recording.",
+        RejectionReason.AUDIO_DISTORTION: "Audio distortion detected. Please move farther from the microphone and try again.",
     }[reason]

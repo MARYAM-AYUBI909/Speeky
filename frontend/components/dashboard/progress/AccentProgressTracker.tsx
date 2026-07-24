@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { AlertTriangle, ArrowRight, Lock, TrendingDown, TrendingUp } from "lucide-react";
+import { AlertTriangle, ArrowRight, Lock, Minus, TrendingDown, TrendingUp } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ApiError } from "@/lib/api";
 import {
@@ -10,6 +10,15 @@ import {
   type AccentProgressTrackerData,
 } from "@/lib/accentProgress";
 import { cn } from "@/lib/utils";
+
+type MetricKey = "pronunciation" | "word_stress" | "intonation" | "clarity";
+
+const METRICS: { key: MetricKey; label: string }[] = [
+  { key: "pronunciation", label: "Pronunciation" },
+  { key: "word_stress", label: "Word Stress" },
+  { key: "intonation", label: "Intonation" },
+  { key: "clarity", label: "Clarity" },
+];
 
 /** ACC-US-12: Accent Progress Tracker - Month-Over-Month Matrix Visualization. */
 export function AccentProgressTracker() {
@@ -47,16 +56,10 @@ export function AccentProgressTracker() {
 
   if (!trackerData) return null;
 
-  const months = trackerData.months || [];
-  const month1 = months.find((m) => m.month === 1);
-  const month3 = months.find((m) => m.month === 3);
-
-  const metricKeys: { key: keyof typeof month1; label: string }[] = [
-    { key: "pronunciation", label: "Pronunciation" },
-    { key: "word_stress", label: "Word Stress" },
-    { key: "intonation", label: "Intonation" },
-    { key: "clarity", label: "Clarity" },
-  ];
+  // Backend returns either the insufficient-data 3-month skeleton (month 1
+  // real, 2 & 3 locked) or every completed month sorted ascending — render
+  // whatever comes back rather than assuming exactly months 1 and 3 exist.
+  const months = [...(trackerData.months || [])].sort((a, b) => a.month - b.month);
 
   return (
     <div className="rounded-2xl border border-border bg-surface-elevated p-6 shadow-sm">
@@ -88,16 +91,16 @@ export function AccentProgressTracker() {
           <thead>
             <tr className="border-b border-border bg-surface text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               <th className="sticky left-0 z-10 bg-surface px-4 py-3">Sub-Metric</th>
-              <th className="px-4 py-3">Month 1 (Baseline)</th>
-              <th className="px-4 py-3">Month 3 (Current)</th>
-              <th className="px-4 py-3">Trend</th>
+              {months.map((m) => (
+                <th key={m.month} className="px-4 py-3">
+                  Month {m.month}
+                  {m.month === 1 ? " (Baseline)" : ""}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
-            {metricKeys.map((item) => {
-              const m1Val = month1 ? (month1[item.key] as number | null) : null;
-              const m3Val = month3 ? (month3[item.key] as number | null) : null;
-              const isLocked = month3?.is_locked ?? trackerData.is_insufficient_data;
+            {METRICS.map((item) => {
               const isRegressed = trackerData.regressed_metrics.includes(item.key);
 
               return (
@@ -111,36 +114,44 @@ export function AccentProgressTracker() {
                   <td className="sticky left-0 z-10 bg-surface-elevated px-4 py-3 font-medium text-foreground">
                     {item.label}
                   </td>
-                  {/* ACC-US-12 E-03: Missing sub-metric displays N/A (not 0) */}
-                  <td className="px-4 py-3 text-foreground">
-                    {m1Val !== null ? `${m1Val}%` : <span className="text-muted-foreground">N/A</span>}
-                  </td>
-                  <td className="px-4 py-3">
-                    {isLocked ? (
-                      <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                        <Lock className="h-3.5 w-3.5" /> Locked (Future Month)
-                      </span>
-                    ) : m3Val !== null ? (
-                      <span className="font-semibold text-foreground">{m3Val}%</span>
-                    ) : (
-                      <span className="text-muted-foreground">N/A</span>
-                    )}
-                  </td>
-                  <td className="px-4 py-3">
-                    {isLocked ? (
-                      <span className="text-xs text-muted-foreground">—</span>
-                    ) : isRegressed ? (
-                      <span className="flex items-center gap-1 text-xs font-semibold text-warning">
-                        <TrendingDown className="h-3.5 w-3.5 text-warning" /> Regressed
-                      </span>
-                    ) : m3Val && m1Val && m3Val > m1Val ? (
-                      <span className="flex items-center gap-1 text-xs font-semibold text-success">
-                        <TrendingUp className="h-3.5 w-3.5 text-success" /> Improved
-                      </span>
-                    ) : (
-                      <span className="text-xs text-muted-foreground">Steady</span>
-                    )}
-                  </td>
+                  {months.map((m, idx) => {
+                    // ACC-US-12 E-03: missing sub-metric renders N/A (not 0)
+                    const val = m[item.key];
+                    const prev = idx > 0 ? months[idx - 1][item.key] : null;
+
+                    if (m.is_locked) {
+                      return (
+                        <td key={m.month} className="px-4 py-3">
+                          <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                            <Lock className="h-3.5 w-3.5" /> Locked (Future Month)
+                          </span>
+                        </td>
+                      );
+                    }
+
+                    return (
+                      <td key={m.month} className="px-4 py-3">
+                        {val === null || val === undefined ? (
+                          <span className="text-muted-foreground">N/A</span>
+                        ) : (
+                          <span className="flex items-center gap-1.5">
+                            <span className="font-semibold text-foreground">{val}%</span>
+                            {idx > 0 && prev !== null && prev !== undefined && (
+                              isRegressed && val < prev ? (
+                                <TrendingDown className="h-3.5 w-3.5 text-warning" aria-label="Regressed" />
+                              ) : val > prev ? (
+                                <TrendingUp className="h-3.5 w-3.5 text-success" aria-label="Improved" />
+                              ) : val < prev ? (
+                                <TrendingDown className="h-3.5 w-3.5 text-muted-foreground" aria-label="Declined" />
+                              ) : (
+                                <Minus className="h-3.5 w-3.5 text-muted-foreground" aria-label="Steady" />
+                              )
+                            )}
+                          </span>
+                        )}
+                      </td>
+                    );
+                  })}
                 </tr>
               );
             })}
@@ -161,7 +172,7 @@ export function AccentProgressTracker() {
             </div>
           </div>
           <Link href="/dashboard/progress/targeted-drills" className="self-end">
-            <Button size="xs" variant="outline">
+            <Button size="sm" variant="outline">
               Start Targeted Drills
             </Button>
           </Link>

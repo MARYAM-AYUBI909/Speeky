@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { ApiError } from "@/lib/api";
 import {
   assessPronunciation,
   fetchPronunciationTts,
@@ -101,8 +102,13 @@ export default function PronunciationCoachPage() {
       setResult(res);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Assessment failed.";
-      if (msg.toLowerCase().includes("multiple voices")) {
+      if (err instanceof ApiError && err.status === 403 && msg.toLowerCase().includes("suspended")) {
+        setError(msg);
+      } else if (msg.toLowerCase().includes("multiple voices")) {
         setError("Multiple voices detected. Try again in a quiet place.");
+      } else if (msg.toLowerCase().includes("stale") || msg.toLowerCase().includes("reused")) {
+        setError("Your reading session expired. Loading a fresh sentence…");
+        loadSentence();
       } else {
         setError(msg);
       }
@@ -116,11 +122,12 @@ export default function PronunciationCoachPage() {
     setTtsSpeed(speed);
     setIsPlayingTts(true);
     try {
-      const res = await fetchPronunciationTts(word, speed);
-      const audioUrl = `data:${res.mime_type};base64,${res.audio_base64}`;
+      const blob = await fetchPronunciationTts(word, speed);
+      const audioUrl = URL.createObjectURL(blob);
       if (audioRef.current) {
         audioRef.current.src = audioUrl;
         void audioRef.current.play();
+        audioRef.current.onended = () => URL.revokeObjectURL(audioUrl);
       }
     } catch {
       setError("Failed to play correct pronunciation.");
@@ -172,7 +179,7 @@ export default function PronunciationCoachPage() {
             Read This Sentence Aloud
           </span>
           <p className="mt-4 font-serif text-2xl font-medium leading-relaxed text-foreground">
-            {sentenceData.sentence}
+            {sentenceData.text}
           </p>
 
           {/* Record Button */}
@@ -251,16 +258,16 @@ export default function PronunciationCoachPage() {
               </span>
               <div className="flex gap-2">
                 <Button
-                  size="xs"
-                  variant={ttsSpeed === "normal" ? "default" : "outline"}
+                  size="sm"
+                  variant={ttsSpeed === "normal" ? "primary" : "outline"}
                   onClick={() => handlePlayWordTts(selectedWord, "normal")}
                   disabled={isPlayingTts}
                 >
                   Normal
                 </Button>
                 <Button
-                  size="xs"
-                  variant={ttsSpeed === "slow" ? "default" : "outline"}
+                  size="sm"
+                  variant={ttsSpeed === "slow" ? "primary" : "outline"}
                   onClick={() => handlePlayWordTts(selectedWord, "slow")}
                   disabled={isPlayingTts}
                 >
@@ -270,11 +277,27 @@ export default function PronunciationCoachPage() {
             </div>
           )}
 
-          {/* PRN-US-10 E-03: Pacing / stuttering tip */}
-          {result.pacing_tip && (
+          {/* ACC-US-11 warning: STT breakdown fallback / accent-calibration model notices */}
+          {result.warning && (
+            <div className="flex items-start gap-2.5 rounded-xl border border-primary/20 bg-primary/5 p-4 text-sm text-foreground">
+              <HelpCircle className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+              {result.warning}
+            </div>
+          )}
+
+          {/* PRN-US-10 E-03: Heavy stuttering / disfluency pacing tip */}
+          {result.disfluency_detected && (
             <div className="flex items-start gap-2.5 rounded-xl border border-warning/30 bg-warning/10 p-4 text-sm text-foreground">
               <HelpCircle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
-              {result.pacing_tip}
+              Heavy pausing or stuttering detected — try reading the sentence once through at a slower, steady pace before recording again.
+            </div>
+          )}
+
+          {/* Background speech interference notice */}
+          {result.background_voice_detected && (
+            <div className="flex items-start gap-2.5 rounded-xl border border-warning/30 bg-warning/10 p-4 text-sm text-foreground">
+              <HelpCircle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+              Background speech was detected during scoring — for the most accurate feedback, retry in a quiet space.
             </div>
           )}
 

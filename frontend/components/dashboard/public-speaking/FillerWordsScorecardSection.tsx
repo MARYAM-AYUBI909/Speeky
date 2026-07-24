@@ -9,9 +9,12 @@ import {
 
 interface Props {
   sessionId: string;
+  // Defaults to the Public Speaking endpoint; Mock Interview passes
+  // getInterviewCoachFillerWords to reuse this same scorecard UI (US-102).
+  fetchFn?: (sessionId: string) => Promise<FillerWordAnalysisResponse>;
 }
 
-export function FillerWordsScorecardSection({ sessionId }: Props) {
+export function FillerWordsScorecardSection({ sessionId, fetchFn = getPublicSpeakingFillerWords }: Props) {
   const [data, setData] = React.useState<FillerWordAnalysisResponse | null>(null);
   const [isLoading, setIsLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
@@ -20,11 +23,11 @@ export function FillerWordsScorecardSection({ sessionId }: Props) {
     if (!sessionId) return;
     setIsLoading(true);
     setError(null);
-    getPublicSpeakingFillerWords(sessionId)
+    fetchFn(sessionId)
       .then(setData)
       .catch((err) => setError(err instanceof Error ? err.message : "Failed to load filler words."))
       .finally(() => setIsLoading(false));
-  }, [sessionId]);
+  }, [sessionId, fetchFn]);
 
   if (isLoading) {
     return (

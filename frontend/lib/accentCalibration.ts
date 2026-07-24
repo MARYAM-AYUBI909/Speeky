@@ -5,17 +5,24 @@ import { api } from "./api";
 // GET  /api/users/me/accent-preference
 // PATCH /api/users/me/accent-preference
 // POST /api/accent-assessment/sub-dialect-dispute
+//
+// Mirrors backend/services/accent_calibration_service.py's VALID_SUB_DIALECTS.
+// "broad_regional" is a frontend-only sentinel for "no sub-dialect selected" —
+// the backend only ever accepts one of the 5 values below or null/omitted,
+// never the literal string "broad_regional" (sending it raises a ValueError).
+export type SubDialect = "punjabi" | "sindhi" | "pashto" | "balochi" | "kashmiri";
 
 export interface AccentPreferenceResponse {
   accent_model_preference: "generic_global" | "south_asian_pakistani";
-  sub_dialect_preference?: "broad_regional" | "punjabi" | "sindhi" | "pashto" | null;
-  is_accent_suspended?: boolean;
-  liveness_flag_count?: number;
+  sub_dialect_preference?: SubDialect | null;
+  // Server-computed notice: low-confidence-dialect fallback warning (ACC-US-09
+  // E-01) or a "beta refinement" confirmation for an active sub-dialect.
+  notice?: string | null;
 }
 
 export interface UpdateAccentPreferenceInput {
   accent_model_preference: "generic_global" | "south_asian_pakistani";
-  sub_dialect_preference?: "broad_regional" | "punjabi" | "sindhi" | "pashto" | null;
+  sub_dialect_preference?: SubDialect | null;
 }
 
 export interface SubDialectDisputeResult {

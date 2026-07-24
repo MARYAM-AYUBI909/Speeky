@@ -8,7 +8,24 @@ import {
   submitSubDialectDispute,
   updateAccentPreference,
   type AccentPreferenceResponse,
+  type SubDialect,
 } from "@/lib/accentCalibration";
+
+// "broad_regional" only ever exists client-side, to represent "no sub-dialect
+// selected" — it must never be sent to the backend as a literal value (see
+// lib/accentCalibration.ts). Balochi/Kashmiri are intentionally included: the
+// backend treats them as low-confidence dialects (ACC-US-09 E-01) and this is
+// the only UI path that can exercise that fallback.
+const SUB_DIALECT_OPTIONS: { id: "broad_regional" | SubDialect; label: string }[] = [
+  { id: "broad_regional", label: "Broad Regional (Default)" },
+  { id: "punjabi", label: "Punjabi-influenced" },
+  { id: "sindhi", label: "Sindhi-influenced" },
+  { id: "pashto", label: "Pashto-influenced" },
+  { id: "balochi", label: "Balochi-influenced" },
+  { id: "kashmiri", label: "Kashmiri-influenced" },
+];
+
+const LOW_CONFIDENCE_SUB_DIALECTS = new Set<SubDialect>(["balochi", "kashmiri"]);
 
 export function LocalAccentCalibrationSection() {
   const [pref, setPref] = React.useState<AccentPreferenceResponse | null>(null);
@@ -44,7 +61,11 @@ export function LocalAccentCalibrationSection() {
     try {
       const updated = await updateAccentPreference({
         accent_model_preference: model,
-        sub_dialect_preference: model === "south_asian_pakistani" ? (pref.sub_dialect_preference || "broad_regional") : null,
+        // Preserve any already-selected sub-dialect when re-enabling the
+        // regional model; otherwise leave it unset (null) — never send the
+        // "broad_regional" placeholder, the backend only accepts the 5 real
+        // sub-dialect values or null.
+        sub_dialect_preference: model === "south_asian_pakistani" ? (pref.sub_dialect_preference ?? null) : null,
       });
       setPref(updated);
     } catch (err) {
@@ -54,14 +75,15 @@ export function LocalAccentCalibrationSection() {
     }
   };
 
-  const handleSubDialectChange = async (sub: "broad_regional" | "punjabi" | "sindhi" | "pashto") => {
+  const handleSubDialectChange = async (sub: "broad_regional" | SubDialect) => {
     if (!pref) return;
     setIsSaving(true);
     setError(null);
+    setDisputeMessage(null);
     try {
       const updated = await updateAccentPreference({
         accent_model_preference: "south_asian_pakistani",
-        sub_dialect_preference: sub,
+        sub_dialect_preference: sub === "broad_regional" ? null : sub,
       });
       setPref(updated);
     } catch (err) {
@@ -77,6 +99,8 @@ export function LocalAccentCalibrationSection() {
     try {
       const res = await submitSubDialectDispute("User requested re-classification of regional sub-dialect influence");
       setDisputeMessage(res.message);
+      // Dispute reverts the server-side preference to the broad regional model.
+      setPref((prev) => (prev ? { ...prev, sub_dialect_preference: null, notice: null } : prev));
     } catch (err) {
       setDisputeMessage("Dispute submitted for review.");
     } finally {
@@ -96,7 +120,8 @@ export function LocalAccentCalibrationSection() {
   }
 
   const isLocalActive = pref?.accent_model_preference === "south_asian_pakistani";
-  const currentSubDialect = pref?.sub_dialect_preference || "broad_regional";
+  const currentSubDialect: "broad_regional" | SubDialect = pref?.sub_dialect_preference || "broad_regional";
+  const isLowConfidence = LOW_CONFIDENCE_SUB_DIALECTS.has(currentSubDialect as SubDialect);
 
   return (
     <div className="rounded-2xl border border-border bg-surface-elevated p-6 shadow-sm">
@@ -187,19 +212,14 @@ export function LocalAccentCalibrationSection() {
             <span className="text-[11px] font-medium text-muted-foreground">Optional</span>
           </div>
 
-          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
-            {[
-              { id: "broad_regional", label: "Broad Regional (Default)" },
-              { id: "punjabi", label: "Punjabi-influenced" },
-              { id: "sindhi", label: "Sindhi-influenced" },
-              { id: "pashto", label: "Pashto-influenced" },
-            ].map((sub) => {
+          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3">
+            {SUB_DIALECT_OPTIONS.map((sub) => {
               const isSelected = currentSubDialect === sub.id;
               return (
                 <button
                   key={sub.id}
                   type="button"
-                  onClick={() => handleSubDialectChange(sub.id as any)}
+                  onClick={() => handleSubDialectChange(sub.id)}
                   disabled={isSaving}
                   className={`rounded-lg border px-3 py-2 text-xs font-medium transition-all ${
                     isSelected
@@ -213,16 +233,26 @@ export function LocalAccentCalibrationSection() {
             })}
           </div>
 
-          {/* Sub-Dialect Info & Dispute Helper */}
-          {currentSubDialect !== "broad_regional" && (
-            <div className="mt-2 flex flex-col gap-2 rounded-lg border border-info/20 bg-info/5 p-3 text-xs text-foreground">
-              <div className="flex items-center justify-between">
+          {/* US-88 E-01/Revert: real server notice — low-confidence fallback
+              warning for Balochi/Kashmiri, or a beta-active confirmation for
+              Punjabi/Sindhi/Pashto — plus a revert-to-broad dispute action. */}
+          {currentSubDialect !== "broad_regional" && pref?.notice && (
+            <div
+              className={`mt-2 flex flex-col gap-2 rounded-lg border p-3 text-xs text-foreground ${
+                isLowConfidence ? "border-warning/30 bg-warning/10" : "border-info/20 bg-info/5"
+              }`}
+            >
+              <div className="flex items-center justify-between gap-3">
                 <span className="flex items-center gap-1.5 font-medium">
-                  <Info className="h-3.5 w-3.5 text-primary" />
-                  Limited data for this dialect — using broader regional model for now
+                  {isLowConfidence ? (
+                    <AlertTriangle className="h-3.5 w-3.5 text-warning shrink-0" />
+                  ) : (
+                    <Info className="h-3.5 w-3.5 text-primary shrink-0" />
+                  )}
+                  {pref.notice}
                 </span>
                 <Button
-                  size="xs"
+                  size="sm"
                   variant="outline"
                   loading={isDisputing}
                   onClick={handleDisputeSubDialect}

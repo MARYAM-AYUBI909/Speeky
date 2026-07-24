@@ -268,6 +268,14 @@ export default function TargetedDrillsPage() {
             </div>
           )}
 
+          {/* ACC-US-11 warning: STT breakdown fallback / model-load / conflict notices */}
+          {drillResult.warning && (
+            <div className="flex items-start gap-2.5 rounded-xl border border-primary/20 bg-primary/5 p-3 text-xs font-medium text-primary">
+              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>{drillResult.warning}</span>
+            </div>
+          )}
+
           {drillResult.placement_tip && (
             <div className="rounded-xl border border-warning/20 bg-warning/10 p-3 text-xs text-foreground">
               <strong>Placement Tip: </strong>{drillResult.placement_tip}

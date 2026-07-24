@@ -64,6 +64,7 @@ enum AccentAssessmentStatus {
   REJECTED_TOO_NOISY
   REJECTED_INCOMPLETE
   REJECTED_MULTIPLE_VOICES
+  REJECTED_DISTORTION
 }
 
 // Public Speaking Coach speech types (PSC-US-01, PSC-US-03, PSC-US-04, PSC-US-05, PSC-US-06, PSC-US-07)
@@ -213,6 +214,15 @@ model BaselineAssessment {
   flagReason         String?
   startedAt          DateTime       @default(now())
   completedAt        DateTime?
+  // BAS-US-01 E-02: set when _complete_assessment's scoring step throws after all
+  // responses are already saved — completedAt stays null so the row still reads as
+  // "in progress" everywhere else, but get_results_summary uses this flag to retry
+  // scoring instead of returning a flat "not completed" 400 forever.
+  scoringFailed      Boolean        @default(false)
+  // PDG-US-10 E-03: distinct from isFlagged/flagReason (integrity checks on the
+  // responses themselves) — records when progress_dashboard_service drops an
+  // out-of-range (>100 or <0) score from the visual aggregate, for review.
+  outlierFlags       Json           @default("[]")
 
   // Every gating/reassessment/trend query filters userId then sorts or filters on completedAt
   @@index([userId, completedAt])
@@ -393,6 +403,8 @@ model PublicSpeakingSession {
   aiQuestion      String?  // AI-generated Q&A question (PSC-US-12)
   userQaResponse  String?  // User's Q&A response
   qaScore         Json?    // Q&A performance evaluation
+  audioFeatures   Json?    // AUDIO pipeline signal snapshot (word_timings etc.) — PSC-US-08
+  outlierFlags    Json     @default("[]") // PDG-US-10 E-03: out-of-range scorecard scores dropped from dashboard aggregates
   createdAt       DateTime @default(now())
   completedAt     DateTime?
 

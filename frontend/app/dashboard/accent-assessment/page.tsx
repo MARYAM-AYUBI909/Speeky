@@ -4,25 +4,28 @@ import * as React from "react";
 import {
   AlertCircle,
   AlertTriangle,
-  CheckCircle2,
-  HelpCircle,
   Info,
   Loader2,
-  Lock,
   Mic,
   RefreshCw,
   ShieldAlert,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
+import { ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import {
   getTargetPassage,
+  rejectionFromError,
   submitLivenessAppeal,
   submitPassageAssessment,
   type AccentAssessmentResult,
   type TargetPassageResponse,
 } from "@/lib/accentAssessment";
+
+function wordCount(text: string): number {
+  const trimmed = text.trim();
+  return trimmed ? trimmed.split(/\s+/).length : 0;
+}
 
 export default function AccentAssessmentPage() {
   const [passageData, setPassageData] = React.useState<TargetPassageResponse | null>(null);
@@ -30,6 +33,7 @@ export default function AccentAssessmentPage() {
   const [isRecording, setIsRecording] = React.useState(false);
   const [isSubmitting, setIsSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [staleToken, setStaleToken] = React.useState(false);
   const [isSuspended, setIsSuspended] = React.useState(false);
   const [result, setResult] = React.useState<AccentAssessmentResult | null>(null);
 
@@ -45,19 +49,15 @@ export default function AccentAssessmentPage() {
   const loadPassage = React.useCallback(async () => {
     setIsLoading(true);
     setError(null);
+    setStaleToken(false);
     setResult(null);
     setAppealData(null);
-    setIsSuspended(false);
+    setAppealMessage(null);
     try {
       const data = await getTargetPassage();
       setPassageData(data);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed to load passage.";
-      if (msg.toLowerCase().includes("suspended")) {
-        setIsSuspended(true);
-      } else {
-        setError(msg);
-      }
+      setError(err instanceof Error ? err.message : "Failed to load passage.");
     } finally {
       setIsLoading(false);
     }
@@ -84,7 +84,7 @@ export default function AccentAssessmentPage() {
       mediaRecorderRef.current = recorder;
       recorder.start();
       setIsRecording(true);
-    } catch (err) {
+    } catch {
       setError("Microphone permission denied or unsupported.");
     }
   };
@@ -100,6 +100,8 @@ export default function AccentAssessmentPage() {
     if (!passageData) return;
     setIsSubmitting(true);
     setError(null);
+    setStaleToken(false);
+    setAppealData(null);
     try {
       const formData = new FormData();
       formData.append("prompt_token", passageData.prompt_token);
@@ -107,21 +109,32 @@ export default function AccentAssessmentPage() {
 
       const res = await submitPassageAssessment(passageData.passage_id, formData);
       setResult(res);
-
-      if (res.appeal_token && res.appeal_prompt) {
-        setAppealData({ appealToken: res.appeal_token, appealPrompt: res.appeal_prompt });
-      }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Assessment failed.";
-      if (msg.toLowerCase().includes("playback") || msg.toLowerCase().includes("stale_token")) {
-        setError("Live reading required — please read the passage directly into your microphone.");
-      } else if (msg.toLowerCase().includes("incomplete")) {
-        setError("The reading appears incomplete — please read the entire passage in one take.");
-      } else if (msg.toLowerCase().includes("quiet") || msg.toLowerCase().includes("noise") || msg.toLowerCase().includes("distortion")) {
-        setError("Recording too quiet, noisy, or distorted. Please retake in a quiet environment.");
-      } else {
-        setError(msg);
+      // 3+ liveness flags: account routed to support review.
+      if (err instanceof ApiError && err.status === 403 && err.message.toLowerCase().includes("suspended")) {
+        setIsSuspended(true);
+        return;
       }
+
+      // Structured rejection (playback detected, incomplete reading, quality
+      // issue, stale token, ...) — carries the real message plus, for playback
+      // flags, an appeal token/prompt for the false-positive appeal flow.
+      const rejection = rejectionFromError(err);
+      if (rejection) {
+        setError(rejection.message);
+        if (rejection.appeal_token && rejection.appeal_prompt) {
+          setAppealData({ appealToken: rejection.appeal_token, appealPrompt: rejection.appeal_prompt });
+        }
+        // ACC-US-01 E-04: this passage's prompt token is dead (stale/reused) — the mic
+        // button would just fail again with the same token, so surface a direct
+        // "fetch new passage" recovery right here instead of only in the results view.
+        if (rejection.reason === "stale_prompt_token") {
+          setStaleToken(true);
+        }
+        return;
+      }
+
+      setError(err instanceof Error ? err.message : "Assessment failed.");
     } finally {
       setIsSubmitting(false);
     }
@@ -139,17 +152,12 @@ export default function AccentAssessmentPage() {
       recorder.onstop = async () => {
         stream.getTracks().forEach((track) => track.stop());
         const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || "audio/webm" });
-        const reader = new FileReader();
-        reader.onloadend = async () => {
-          const base64 = (reader.result as string).split(",")[1];
-          await handleSendAppeal(base64);
-        };
-        reader.readAsDataURL(blob);
+        await handleSendAppeal(blob);
       };
       mediaRecorderRef.current = recorder;
       recorder.start();
       setIsAppealRecording(true);
-    } catch (err) {
+    } catch {
       setError("Microphone permission denied for appeal.");
     }
   };
@@ -161,27 +169,20 @@ export default function AccentAssessmentPage() {
     }
   };
 
-  const handleSendAppeal = async (audioBase64: string) => {
-    if (!passageData || !appealData) return;
+  const handleSendAppeal = async (audioBlob: Blob) => {
+    if (!appealData) return;
     setIsSubmittingAppeal(true);
     setAppealMessage(null);
     try {
-      const res = await submitLivenessAppeal({
-        passage_id: passageData.passage_id,
-        appeal_token: appealData.appealToken,
-        audio_data: audioBase64,
-      });
-      if (res.status === "approved") {
-        setAppealMessage("Appeal approved! Your assessment has been verified.");
-        if (res.assessment_result) {
-          setResult(res.assessment_result);
-        }
+      const res = await submitLivenessAppeal(appealData.appealToken, audioBlob);
+      if (res.appeal_passed) {
+        setAppealMessage("Appeal approved! Please record the passage again to complete your assessment.");
         setAppealData(null);
       } else {
         setAppealMessage(res.message || "Appeal failed. Live reading verification required.");
       }
     } catch (err) {
-      setAppealMessage("Appeal processing failed. Please try again.");
+      setAppealMessage(err instanceof Error ? err.message : "Appeal processing failed. Please try again.");
     } finally {
       setIsSubmittingAppeal(false);
     }
@@ -213,6 +214,17 @@ export default function AccentAssessmentPage() {
     );
   }
 
+  const overallScore = result
+    ? Math.round(
+        (result.pronunciation_score +
+          result.stress_score +
+          result.rhythm_score +
+          result.intonation_score +
+          result.clarity_score) /
+          5
+      )
+    : null;
+
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-6">
       <div className="flex flex-col gap-1">
@@ -227,7 +239,14 @@ export default function AccentAssessmentPage() {
       {error && (
         <div className="flex items-start gap-2.5 rounded-xl border border-danger/30 bg-danger/10 px-4 py-3 text-sm text-foreground">
           <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
-          <span>{error}</span>
+          <div className="flex flex-1 flex-wrap items-center justify-between gap-2">
+            <span>{error}</span>
+            {staleToken && (
+              <Button size="sm" variant="outline" onClick={loadPassage}>
+                <RefreshCw className="mr-1.5 h-3.5 w-3.5" /> Fetch New Passage
+              </Button>
+            )}
+          </div>
         </div>
       )}
 
@@ -236,7 +255,7 @@ export default function AccentAssessmentPage() {
         <div className="rounded-2xl border border-border bg-surface-elevated p-8 shadow-sm">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Passage ({passageData.word_count} words)
+              Passage ({wordCount(passageData.text)} words)
             </span>
             <span className="rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-medium text-primary">
               Live Token Active
@@ -244,7 +263,7 @@ export default function AccentAssessmentPage() {
           </div>
 
           <p className="mt-4 font-serif text-lg leading-relaxed text-foreground">
-            "{passageData.passage}"
+            "{passageData.text}"
           </p>
 
           <div className="mt-8 flex flex-col items-center gap-4">
@@ -299,7 +318,7 @@ export default function AccentAssessmentPage() {
           <div className="flex justify-end gap-3 pt-2">
             <Button
               size="sm"
-              variant={isAppealRecording ? "danger" : "default"}
+              variant={isAppealRecording ? "danger" : "primary"}
               loading={isSubmittingAppeal}
               onClick={isAppealRecording ? handleStopAppealRecording : handleStartAppealRecording}
             >
@@ -322,7 +341,7 @@ export default function AccentAssessmentPage() {
               </p>
             </div>
             <span className="text-3xl font-bold text-primary">
-              {result.overall_score}%
+              {overallScore}%
             </span>
           </div>
 
@@ -350,7 +369,7 @@ export default function AccentAssessmentPage() {
             </div>
           </div>
 
-          {/* ACC-US-14 Unmapped Accent Default Clarity Banner */}
+          {/* ACC-US-14 / ACC-US-11: distortion fallback, unmapped-accent, or model-load warnings */}
           {result.warning && (
             <div className="flex items-start gap-2.5 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3 text-xs font-medium text-primary">
               <Info className="mt-0.5 h-4 w-4 shrink-0" />

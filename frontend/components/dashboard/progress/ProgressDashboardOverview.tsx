@@ -78,7 +78,7 @@ export function ProgressDashboardOverview() {
             Welcome to Your Learning Journey!
           </h2>
           <p className="text-sm text-muted-foreground">
-            {data.empty_state_prompt || "Complete your first session or Daily Challenge to see your progress growth!"}
+            {data.empty_state_prompt || "Complete your first session to see your progress growth!"}
           </p>
         </div>
 

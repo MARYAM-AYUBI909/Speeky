@@ -66,6 +66,12 @@ export default function AssessmentPage() {
     if (pendingId) {
       getResultsSummary(pendingId)
         .then((summary) => {
+          if ("status" in summary) {
+            // BAS-US-01 E-02/E-03: still scoring — keep the pending ID and resume
+            // the analyzing/retry flow rather than rendering an incomplete summary.
+            fetchResultsWithAnalysisStep(pendingId);
+            return;
+          }
           localStorage.removeItem("speeky_pending_baseline_id");
           setStep({ name: "results", summary });
         })
@@ -166,6 +172,15 @@ export default function AssessmentPage() {
       localStorage.setItem("speeky_pending_baseline_id", assessmentId);
 
       const summary = await getResultsSummary(assessmentId);
+      if ("status" in summary) {
+        // BAS-US-01 E-02: scoring failed server-side but responses are safe — keep the
+        // pending ID (so a force-close still recovers) and retry automatically instead
+        // of surfacing this as a dead-end error.
+        if (analysisTimerRef.current) clearInterval(analysisTimerRef.current);
+        setError(summary.message);
+        setTimeout(() => fetchResultsWithAnalysisStep(assessmentId), 4000);
+        return;
+      }
       if (analysisTimerRef.current) clearInterval(analysisTimerRef.current);
       localStorage.removeItem("speeky_pending_baseline_id");
       await refresh();
@@ -205,6 +220,12 @@ export default function AssessmentPage() {
 
       if (result.status === "completed") {
         await fetchResultsWithAnalysisStep(step.assessmentId);
+      } else if (result.status === "processing") {
+        // BAS-US-01 E-02: scoring failed on this final submission — reuse the same
+        // analyzing/auto-retry flow the polling path already handles correctly,
+        // instead of falling through to the in-progress branch below with no
+        // next_question/question_index to show.
+        await fetchResultsWithAnalysisStep(step.assessmentId);
       } else {
         setStep({
           ...step,
@@ -224,7 +245,10 @@ export default function AssessmentPage() {
     voiceStartedAt.current = performance.now();
     voiceAnswerUsed.current = true;
     setVoiceStatus("Listening... Speak your response clearly.");
-    start();
+    start((text) => {
+      setAnswer(text);
+      setVoiceStatus("Captured your spoken response.");
+    });
   }
 
   function handleStopVoice() {

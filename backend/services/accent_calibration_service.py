@@ -229,9 +229,9 @@ def handle_stt_breakdown_fallback(analysis: RecordingAnalysis) -> Tuple[bool, Op
     """
     if not analysis.transcript or len(analysis.words) == 0:
         pitch_sd = 10.0
-        if analysis.prosody and len(analysis.prosody.f0_contour) > 5:
+        if analysis.prosody and len(analysis.prosody.pitch_hz) > 5:
             import numpy as np
-            voiced = [f for f in analysis.prosody.f0_contour if f > 0]
+            voiced = [f for f in analysis.prosody.pitch_hz if f > 0]
             if len(voiced) > 5:
                 pitch_sd = float(np.std(voiced))
 

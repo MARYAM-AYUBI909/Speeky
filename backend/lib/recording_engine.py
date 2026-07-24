@@ -43,6 +43,32 @@ class RecordingAnalysis:
     prosody: prosody_engine.ProsodyData
     multiple_voices_detected: bool
     rejection: Optional[RejectionReason] = None
+    high_freq_energy_ratio: float = 1.0  # 1.0 default = "not suspicious" for callers/tests that don't set it
+
+
+def _high_freq_energy_ratio(waveform, sample_rate: int) -> float:
+    """Fraction of total spectral energy sitting in the top 10% of the Nyquist band.
+
+    Best-effort proxy for compression artifacts (ACC-US-01's playback-detection AC
+    explicitly names these): lossy speech codecs and multi-generation playback/
+    re-recording commonly apply a low-pass cutoff well below Nyquist, silently gutting
+    this band, while genuine live mic capture keeps a small but nonzero tail up there
+    from sibilance and room/mic noise even in a quiet room. Not real spectral/codec
+    analysis (no format sniffing, no MDCT-block artifact detection) -- a cheap signal
+    alongside the existing noise-floor/SNR/pitch-flatness checks, not a replacement.
+    """
+    import numpy as np
+
+    if len(waveform) < 1024:
+        return 1.0
+    spectrum = np.abs(np.fft.rfft(waveform))
+    freqs = np.fft.rfftfreq(len(waveform), d=1.0 / sample_rate)
+    total_energy = float(np.sum(spectrum ** 2))
+    if total_energy <= 0:
+        return 1.0
+    cutoff_hz = 0.9 * (sample_rate / 2.0)
+    high_energy = float(np.sum(spectrum[freqs >= cutoff_hz] ** 2))
+    return high_energy / total_energy
 
 
 def analyze_recording(audio_bytes: bytes, config: SpeechConfig) -> RecordingAnalysis:
@@ -96,6 +122,7 @@ def analyze_recording(audio_bytes: bytes, config: SpeechConfig) -> RecordingAnal
         prosody=prosody,
         multiple_voices_detected=multiple_voices,
         rejection=rejection,
+        high_freq_energy_ratio=_high_freq_energy_ratio(waveform, sample_rate),
     )
 
 
@@ -177,9 +204,14 @@ def detect_playback_audio(analysis: RecordingAnalysis, config: SpeechConfig) -> 
         return RejectionReason.PLAYBACK_DETECTED
     if analysis.snr_db > 55.0 and analysis.duration_seconds > 2.0:
         return RejectionReason.PLAYBACK_DETECTED
-    if analysis.prosody and len(analysis.prosody.f0_contour) > 10:
+    if (
+        analysis.duration_seconds > 1.0
+        and analysis.high_freq_energy_ratio < config.liveness_min_high_freq_energy_ratio
+    ):
+        return RejectionReason.PLAYBACK_DETECTED
+    if analysis.prosody and len(analysis.prosody.pitch_hz) > 10:
         import numpy as np
-        voiced = [f for f in analysis.prosody.f0_contour if f > 0]
+        voiced = [f for f in analysis.prosody.pitch_hz if f > 0]
         if len(voiced) > 10 and np.std(voiced) < 0.5:
             return RejectionReason.PLAYBACK_DETECTED
     return None

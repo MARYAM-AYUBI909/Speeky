@@ -6,16 +6,14 @@ import { api } from "./api";
 
 export interface MonthMetric {
   month: number;
-  label: string;
-  is_locked: boolean;
   pronunciation: number | null;
   word_stress: number | null;
   intonation: number | null;
   clarity: number | null;
+  is_locked: boolean;
 }
 
 export interface AccentProgressTrackerData {
-  user_id: string;
   is_insufficient_data: boolean;
   message?: string | null;
   cta_suggestion?: string | null;

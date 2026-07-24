@@ -16,6 +16,10 @@ export interface VoiceTokenResult {
   room: string;
 }
 
+// Ceiling for how long stopVoice() waits for an in-flight transcript before giving up
+// and disconnecting anyway — matches the product's stated max latency budget.
+const STOP_WAIT_MS = 15000;
+
 /**
  * Shared LiveKit voice-in hook: connects to a per-session LiveKit room, publishes the
  * mic, and forwards transcripts the voice_agent/ worker sends back over the data
@@ -30,6 +34,7 @@ export function useLiveKitVoice(
 ) {
   const [isVoiceActive, setIsVoiceActive] = React.useState(false);
   const [isConnectingVoice, setIsConnectingVoice] = React.useState(false);
+  const [isStoppingVoice, setIsStoppingVoice] = React.useState(false);
   const [voiceStatus, setVoiceStatus] = React.useState("");
   const [error, setError] = React.useState<string | null>(null);
 
@@ -37,6 +42,13 @@ export function useLiveKitVoice(
   const microphoneTrackRef = React.useRef<LocalAudioTrack | null>(null);
   const onTranscriptRef = React.useRef(onTranscript);
   onTranscriptRef.current = onTranscript;
+  // True from a "speaking" status until the matching transcript lands — lets stopVoice()
+  // know whether there's anything worth waiting for, instead of always waiting/never
+  // waiting.
+  const utteranceInFlightRef = React.useRef(false);
+  // Set by stopVoice() while it's waiting; the DataReceived handler resolves it early
+  // the moment the transcript it's waiting for actually arrives.
+  const pendingStopResolveRef = React.useRef<(() => void) | null>(null);
 
   const startVoice = React.useCallback(async () => {
     if (roomRef.current) return;
@@ -44,6 +56,7 @@ export function useLiveKitVoice(
     setError(null);
     setIsConnectingVoice(true);
     setVoiceStatus("Connecting voice...");
+    utteranceInFlightRef.current = false;
 
     // Local reference (not the ref) so the catch block can clean up a room that
     // connected but failed a later step (e.g. mic publish) — roomRef itself is only
@@ -55,27 +68,18 @@ export function useLiveKitVoice(
       const voiceData = await fetchToken();
       room = new Room();
 
-      room.on(RoomEvent.Disconnected, (reason) => {
-        console.log("[voice] room disconnected, reason:", reason);
+      room.on(RoomEvent.Disconnected, () => {
+        // console.log("[voice] room disconnected, reason:", reason);
         setIsVoiceActive(false);
         setVoiceStatus("Voice disconnected.");
       });
 
-      room.on(RoomEvent.ParticipantConnected, (p) => {
-        console.log("[voice] participant joined room:", p.identity);
-      });
+      // room.on(RoomEvent.ParticipantConnected, (p) => {
+      //   console.log("[voice] participant joined room:", p.identity);
+      // });
 
       // reason=1 (CLIENT_INITIATED) only tells us the JS SDK sent the leave — not WHY.
-      // These catch every path that could trigger it: our own code (logged with a stack
-      // so we can see which call site), a failed auto-reconnect, or the mic track itself
-      // dying (device/permission issue).
-      room.on(RoomEvent.Reconnecting, () => console.warn("[voice] reconnecting..."));
-      room.on(RoomEvent.Reconnected, () => console.log("[voice] reconnected"));
-      room.on(RoomEvent.SignalReconnecting, () => console.warn("[voice] signal reconnecting..."));
-      room.on(RoomEvent.MediaDevicesError, (e) => console.error("[voice] media device error:", e));
-      room.on(RoomEvent.LocalTrackUnpublished, (pub) =>
-        console.warn("[voice] local track unpublished:", pub.trackSid, "reason unknown"),
-      );
+      // These catch every path that could trigger it "reconnecting, reconnected, media-device-error" etc... with the mic track itself dying (device/permission issue).
 
       // Logged unconditionally (not just on topic match) so a topic/payload mismatch
       // shows up in devtools instead of silently doing nothing.
@@ -85,23 +89,37 @@ export function useLiveKitVoice(
           from: participant?.identity,
           bytes: payload.length,
         });
-        if (topic !== "voice_transcript") return;
         try {
-          const { text } = JSON.parse(new TextDecoder().decode(payload));
+          const data = JSON.parse(new TextDecoder().decode(payload));
+          if (topic === "voice_status") {
+            if (data.status === "speaking") utteranceInFlightRef.current = true;
+            return;
+          }
+          if (topic !== "voice_transcript") return;
+          const text: string = data.text;
+          utteranceInFlightRef.current = false;
+          pendingStopResolveRef.current?.();
           if (!text) return;
           onTranscriptRef.current(text);
           setVoiceStatus("Heard you — review and hit Send.");
         } catch (err) {
-          console.error("Failed to parse voice transcript payload:", err);
+          console.error("Failed to parse voice data payload:", err);
         }
       });
 
       await room.connect(voiceData.url, voiceData.token);
-      console.log("[voice] connected to room", voiceData.room, "state:", room.state);
+      console.log(
+        "[voice] connected to room",
+        voiceData.room,
+        "state:",
+        room.state,
+      );
 
       const microphoneTrack = await createLocalAudioTrack();
       microphoneTrack.mediaStreamTrack.addEventListener("ended", () =>
-        console.error("[voice] mic MediaStreamTrack ended unexpectedly (device lost/revoked?)"),
+        console.error(
+          "[voice] mic MediaStreamTrack ended unexpectedly (device lost/revoked?)",
+        ),
       );
       await room.localParticipant.publishTrack(microphoneTrack, {
         source: Track.Source.Microphone,
@@ -138,18 +156,38 @@ export function useLiveKitVoice(
   }, [fetchToken]);
 
   const stopVoice = React.useCallback(async () => {
-    console.trace("[voice] disconnect call site: stopVoice (manual or auto)");
-    setVoiceStatus("Stopping voice...");
+    const room = roomRef.current;
+    if (!room) return;
+
+    setIsStoppingVoice(true);
     try {
+      // Unpublish (not disconnect) first — this ends the agent's audio stream, which
+      // already flushes/finalizes any in-progress speech (agent.py's forward_frames()
+      // calls vad_stream.end_input() when the stream ends), so a transcript for
+      // whatever was just said still arrives even though the user hit Stop mid-utterance.
       if (microphoneTrackRef.current) {
-        microphoneTrackRef.current.stop();
+        const track = microphoneTrackRef.current;
         microphoneTrackRef.current = null;
+        await room.localParticipant.unpublishTrack(
+          track,
+          /* stopOnUnpublish */ true,
+        );
       }
-      if (roomRef.current) {
-        await roomRef.current.disconnect();
-        roomRef.current = null;
+
+      if (utteranceInFlightRef.current) {
+        setVoiceStatus("Finishing up — transcribing your answer...");
+        await new Promise<void>((resolve) => {
+          pendingStopResolveRef.current = resolve;
+          setTimeout(resolve, STOP_WAIT_MS);
+        });
+        pendingStopResolveRef.current = null;
       }
+
+      console.trace("[voice] disconnect call site: stopVoice (manual or auto)");
+      roomRef.current = null;
+      await room.disconnect();
     } finally {
+      setIsStoppingVoice(false);
       setIsVoiceActive(false);
       setVoiceStatus("Voice stopped.");
     }
@@ -177,5 +215,13 @@ export function useLiveKitVoice(
     };
   }, []);
 
-  return { isVoiceActive, isConnectingVoice, voiceStatus, error, startVoice, stopVoice };
+  return {
+    isVoiceActive,
+    isConnectingVoice,
+    isStoppingVoice,
+    voiceStatus,
+    error,
+    startVoice,
+    stopVoice,
+  };
 }

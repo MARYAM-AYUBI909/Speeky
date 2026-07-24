@@ -54,6 +54,10 @@ export default function AssessmentPage() {
   const [analysisDuration, setAnalysisDuration] = React.useState(0);
   const analysisTimerRef = React.useRef<NodeJS.Timeout | null>(null);
 
+  // Decide the initial step exactly once. refresh() (called after finishing
+  // the assessment) toggles accessLoading true->false again, which would
+  // otherwise re-run this and clobber the "results" step with
+  // "already-assessed" right after the user finishes — see hasInitialized.
   const hasInitialized = React.useRef(false);
 
   // BAS-US-01: Force-close restoration check
@@ -99,7 +103,6 @@ export default function AssessmentPage() {
       setStep({ name: "intro" });
     }
   }, [accessLoading, access]);
-
   const [voiceStatus, setVoiceStatus] = React.useState("");
   const voiceStartedAt = React.useRef<number | null>(null);
   const voiceAnswerUsed = React.useRef(false);
@@ -242,6 +245,12 @@ export default function AssessmentPage() {
   }
 
   function handleStartVoice() {
+    if (
+      step.name !== "question" ||
+      step.questionMode !== "audio" ||
+      isListening
+    )
+      return;
     voiceStartedAt.current = performance.now();
     voiceAnswerUsed.current = true;
     setVoiceStatus("Listening... Speak your response clearly.");

@@ -14,6 +14,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
+from routers.voice_consent_routes import router as voice_consent_router
 
 from lib.prisma_client import db
 from middlewares.error_handler import (
@@ -30,12 +31,15 @@ from routers.assessment_routes import router as assessment_router
 from routers.coaching_routes import router as coaching_router
 from routers.conversation_routes import router as conversation_router
 from routers.interview_coach_routes import router as interview_coach_router
+from routers.pronunciation_routes import router as pronunciation_router
+from routers.accent_routes import router as accent_router
+from routers.practice_time_routes import router as practice_time_router
 from routers.progress_dashboard_routes import router as progress_dashboard_router
+from routers.accent_progress_routes import router as accent_progress_router
 from routers.resume_jd_routes import router as resume_jd_router
 from routers.scenario_routes import router as scenario_router
 from routers.session_memory_routes import router as session_memory_router
-from routers.pronunciation_routes import router as pronunciation_router
-from routers.accent_routes import router as accent_router
+from routers.vocabulary_progress_routes import router as vocabulary_progress_router
 from routers.public_speaking_routes import router as public_speaking_router
 from utils.app_error import AppError
 
@@ -78,7 +82,7 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 async def health():
     return HTMLResponse("<h1>Speeky API is running!</h1>")
 
-
+app.include_router(voice_consent_router, prefix="/api/voice-consent")
 app.include_router(auth_router, prefix="/api/auth")
 app.include_router(user_router, prefix="/api/users")
 app.include_router(assessment_router, prefix="/api/assessment")
@@ -92,6 +96,8 @@ app.include_router(progress_dashboard_router, prefix="/api/progress-dashboard")
 app.include_router(accent_progress_router, prefix="/api/accent-progress")
 app.include_router(pronunciation_router, prefix="/api/pronunciation-coach")
 app.include_router(accent_router, prefix="/api/accent-assessment")
+app.include_router(vocabulary_progress_router, prefix="/api/vocabulary-progress")
+app.include_router(practice_time_router, prefix="/api/practice-time")
 app.include_router(public_speaking_router, prefix="/api/public-speaking")
 
 # Local-folder avatar storage, exposed to frontend as static files

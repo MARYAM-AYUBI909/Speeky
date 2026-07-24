@@ -56,6 +56,7 @@ export default function ConversationSessionPage() {
   const {
     isVoiceActive,
     isConnectingVoice,
+    isStoppingVoice,
     voiceStatus,
     error: voiceError,
     startVoice,
@@ -365,6 +366,7 @@ export default function ConversationSessionPage() {
             <Button
               size="md"
               variant="outline"
+              loading={isStoppingVoice}
               onClick={() => void handleStopVoice()}
             >
               <MicOff className="h-4 w-4" aria-hidden="true" />

@@ -108,6 +108,23 @@ def _offline_politeness(turns: List[Dict]) -> float:
     return round(max(0.0, min(100.0, score)), 2)
 
 
+def _offline_tips(scenario_meta: Dict, turns: List[Dict], vocab_used: List[str], met_goal: bool) -> List[str]:
+    """Deterministic 'tips' derivation from data already computed elsewhere — no LLM call,
+    used both as the offline grader's tips and to backfill LLM tips that come back empty."""
+    tips: List[str] = []
+    missing = [w for w in scenario_meta.get("target_vocab", []) if w not in vocab_used]
+    if missing:
+        tips.append(f"Try working these words in next time: {', '.join(missing[:3])}.")
+    politeness = _offline_politeness(turns)
+    if politeness < 70:
+        tips.append("Soften your phrasing — lead with \"Could I...\" or \"Would you mind...\" instead of blunt demands.")
+    if scenario_meta.get("goal_type") == "negotiation" and not met_goal:
+        tips.append("Don't accept the first answer — push back once more with a clear reason before settling.")
+    if not tips:
+        tips.append("Solid run — keep practicing to build consistency.")
+    return tips[:3]
+
+
 def offline_grade(scenario_meta: Dict, turns: List[Dict], vocab_used: List[str]) -> Dict:
     """Deterministic grader used when Groq isn't configured/reachable."""
     met_goal = True
@@ -121,11 +138,16 @@ def offline_grade(scenario_meta: Dict, turns: List[Dict], vocab_used: List[str])
         if vocab_used
         else "Try working more of the target vocabulary into your responses next time."
     )
+    tips = _offline_tips(scenario_meta, turns, vocab_used, met_goal)
     return {
         "politeness": _offline_politeness(turns),
         "met_goal": met_goal,
         "summary": summary,
-        "suggestion": "Reread the target vocabulary list before your next attempt.",
+        "suggestion": tips[0],
+        "tips": tips,
+        # Rewriting prose convincingly needs an LLM — offline mode skips it rather than faking one.
+        "original_line": "",
+        "polished_line": "",
         "_source": "offline",
     }
 
@@ -142,11 +164,18 @@ async def grade_session(scenario_meta: Dict, turns: List[Dict], vocab_used: List
         raw = await llm_client.chat_json(
             [{"role": "user", "content": grading_prompt}], temperature=0.2, max_tokens=500
         )
+        met_goal = bool(raw.get("met_goal", True))
+        tips = [str(t).strip() for t in (raw.get("tips") or []) if str(t).strip()][:3]
+        if not tips:
+            tips = _offline_tips(scenario_meta, turns, vocab_used, met_goal)
         return {
             "politeness": max(0.0, min(100.0, float(raw.get("politeness", 0) or 0))),
-            "met_goal": bool(raw.get("met_goal", True)),
+            "met_goal": met_goal,
             "summary": raw.get("summary", ""),
-            "suggestion": raw.get("suggestion", ""),
+            "suggestion": raw.get("suggestion", "") or tips[0],
+            "tips": tips,
+            "original_line": raw.get("original_line", "") or "",
+            "polished_line": raw.get("polished_line", "") or "",
             "_source": "llm",
         }
     except (llm_client.LLMError, TypeError, ValueError) as e:
@@ -330,11 +359,15 @@ async def start_session(payload: StartScenarioSchema, user_id: str = Depends(req
     }
 
 
-async def _finalize_session(session_id: str, meta: Dict, target_vocab: List[str],
-                            turns: List[Dict], status: str) -> Dict:
+# Maps SBL's turn classifications onto session_memory_service.WEAKNESS_FLAGS' vocabulary —
+# "emergency" and "ok" aren't weaknesses worth tracking across sessions, so they're omitted.
+_WEAKNESS_FLAG_MAP = {"rambling": "rambling", "aggressive": "aggressive_tone", "silence": "prolonged_silence"}
+
+
+async def _finalize_session(session_id: str, user_id: str, meta: Dict, target_vocab: List[str],
+                            turns: List[Dict], status: str, flags: List[str]) -> Dict:
     """Grade + persist a session as done — shared by end_session (explicit) and
-    send_turn's silence auto-close (SBL-US-01 E-03: 'AI prompts twice, then gently
-    auto-closes the scenario saving progress')."""
+    send_turn's silence/aggression auto-close paths."""
     coverage = _vocab_coverage(turns, target_vocab)
     grade = await grade_session(meta, turns, coverage["used"])
     vocabulary_score = round(100 * len(coverage["used"]) / max(1, len(target_vocab)), 2)
@@ -351,9 +384,33 @@ async def _finalize_session(session_id: str, meta: Dict, target_vocab: List[str]
             "confidenceScore": confidence,
             "metGoal": grade["met_goal"],
             "summary": grade["summary"],
+            "tips": grade["tips"],
+            "originalLine": grade["original_line"] or None,
+            "polishedLine": grade["polished_line"] or None,
+            "flags": Json(flags),
             "completedAt": datetime.now(timezone.utc),
         },
     )
+
+    # Feed the generic cross-session memory profile (same shared infra conversation_service
+    # uses) so recurring weak areas show up on the Profile page and in future personalized
+    # openings, regardless of which feature the practice happened in.
+    try:
+        from services.session_memory_service import _record_session
+        from schemas.session_memory_schemas import RecordSessionRequest
+
+        await _record_session(user_id, RecordSessionRequest(
+            session_id=session_id, session_type="scenario",
+            flags_seen=flags, topic_or_mode=meta.get("label"),
+            overall_score=int(round(confidence)),
+        ))
+    except Exception:
+        pass  # best-effort — scenario scoring must not fail because memory logging did
+
+    from services.vocabulary_progress_service import record_usage
+
+    await record_usage(user_id, coverage["used"], coverage["missing"])
+
     return {
         "session_id": session_id,
         "status": status,
@@ -363,6 +420,9 @@ async def _finalize_session(session_id: str, meta: Dict, target_vocab: List[str]
         "met_goal": grade["met_goal"] if meta.get("goal_type") == "negotiation" else None,
         "summary": grade["summary"],
         "suggestion": grade["suggestion"],
+        "tips": grade["tips"],
+        "original_line": grade["original_line"],
+        "polished_line": grade["polished_line"],
         "graded_by": grade["_source"],
     }
 
@@ -383,11 +443,15 @@ async def send_turn(session_id: str, payload: ScenarioTurnSchema, user_id: str =
     silence_streak = session.silenceStreak + 1 if classification == "silence" else 0
     aggression_streak = session.aggressionStreak + 1 if classification == "aggressive" else 0
 
+    flags = list(session.flags)
+    if classification in _WEAKNESS_FLAG_MAP:
+        flags.append(_WEAKNESS_FLAG_MAP[classification])
+
     # (The frontend fires an empty turn after IDLE_TIMEOUT_SECONDS of inactivity, so this
     # also covers "stayed in the session but never spoke or typed", not just short replies.)
     if classification == "silence" and silence_streak >= SILENCE_STREAK_LIMIT:
         turns.append({"role": "assistant", "content": _SILENCE_AUTO_CLOSE_REPLY})
-        await _finalize_session(session_id, meta, session.targetVocab, turns, "completed")
+        await _finalize_session(session_id, user_id, meta, session.targetVocab, turns, "completed", flags)
         return {
             "session_id": session_id,
             "reply": _SILENCE_AUTO_CLOSE_REPLY,
@@ -399,7 +463,7 @@ async def send_turn(session_id: str, payload: ScenarioTurnSchema, user_id: str =
     # graduated, matching how a real person would react, not an instant kill on turn one.
     if classification == "aggressive" and aggression_streak >= AGGRESSION_STREAK_LIMIT:
         turns.append({"role": "assistant", "content": _AGGRESSION_AUTO_CLOSE_REPLY})
-        await _finalize_session(session_id, meta, session.targetVocab, turns, "ended_early")
+        await _finalize_session(session_id, user_id, meta, session.targetVocab, turns, "ended_early", flags)
         return {
             "session_id": session_id,
             "reply": _AGGRESSION_AUTO_CLOSE_REPLY,
@@ -417,6 +481,7 @@ async def send_turn(session_id: str, payload: ScenarioTurnSchema, user_id: str =
         data={
             "turns": Json(turns), "status": new_status,
             "silenceStreak": silence_streak, "aggressionStreak": aggression_streak,
+            "flags": Json(flags),
         },
     )
     return {
@@ -436,7 +501,9 @@ async def end_session(session_id: str, user_id: str = Depends(require_auth)):
 
     meta = await scenario_meta(session.scenarioKey)
     final_status = session.status if session.status == "ended_early" else "completed"
-    return await _finalize_session(session_id, meta, session.targetVocab, list(session.turns), final_status)
+    return await _finalize_session(
+        session_id, user_id, meta, session.targetVocab, list(session.turns), final_status, list(session.flags)
+    )
 
 
 async def get_session(session_id: str, user_id: str = Depends(require_auth)):
@@ -457,6 +524,9 @@ async def get_session(session_id: str, user_id: str = Depends(require_auth)):
         },
         "met_goal": session.metGoal,
         "summary": session.summary,
+        "tips": session.tips,
+        "original_line": session.originalLine,
+        "polished_line": session.polishedLine,
         "completed_at": session.completedAt.isoformat() if session.completedAt else None,
     }
 

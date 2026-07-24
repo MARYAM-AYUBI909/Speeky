@@ -43,6 +43,9 @@ export interface ScenarioEndResult {
   met_goal: boolean | null;
   summary: string;
   suggestion: string;
+  tips: string[];
+  original_line: string;
+  polished_line: string;
   graded_by: string;
 }
 
@@ -90,6 +93,9 @@ export interface ScenarioSessionState {
   scores: { politeness: number | null; vocabulary: number | null; confidence: number | null };
   met_goal: boolean | null;
   summary: string | null;
+  tips: string[];
+  original_line: string | null;
+  polished_line: string | null;
   completed_at: string | null;
 }
 
@@ -106,7 +112,10 @@ export async function getScenarioSession(sessionId: string): Promise<ScenarioEnd
     vocab_missing: session.target_vocab.filter((w) => !session.vocab_used.includes(w)),
     met_goal: session.met_goal,
     summary: session.summary ?? "",
-    suggestion: "",
+    suggestion: session.tips?.[0] ?? "",
+    tips: session.tips ?? [],
+    original_line: session.original_line ?? "",
+    polished_line: session.polished_line ?? "",
     graded_by: "",
   };
 }

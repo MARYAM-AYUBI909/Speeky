@@ -79,6 +79,7 @@ export default function InterviewCoachSessionPage() {
   const {
     isVoiceActive,
     isConnectingVoice,
+    isStoppingVoice,
     voiceStatus,
     error: voiceError,
     startVoice,
@@ -321,7 +322,12 @@ export default function InterviewCoachSessionPage() {
               Send
             </Button>
             {isVoiceActive ? (
-              <Button size="md" variant="outline" onClick={() => void stopVoice()}>
+              <Button
+                size="md"
+                variant="outline"
+                loading={isStoppingVoice}
+                onClick={() => void stopVoice()}
+              >
                 <MicOff className="h-4 w-4" aria-hidden="true" />
                 Stop Voice
               </Button>

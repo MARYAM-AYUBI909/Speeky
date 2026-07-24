@@ -736,12 +736,19 @@ Full transcript (learner turns only, in order):
 Evaluate the learner's POLITENESS/TONE as the headline metric (0-100) — were they polite,
 natural, and appropriate for this scene? Do not focus on grammar correctness.
 
+Also pick ONE real turn the learner actually said (their weakest or most awkward moment) and
+rewrite just that line as a stronger, more natural version — a concrete before/after example.
+Never invent a turn they didn't say; if every turn was already solid, leave polished_line empty.
+
 Respond ONLY with a JSON object, no prose, in exactly this shape:
 {{
   "politeness": <0-100 integer>,
   "met_goal": <true|false>,
   "summary": "<2-3 sentence coaching summary>",
-  "suggestion": "<one concrete tip for next time>"
+  "suggestion": "<one concrete tip for next time>",
+  "tips": ["<short concrete tip>", "<short concrete tip>", "<up to 3 total>"],
+  "original_line": "<the exact learner turn being rewritten, or empty string>",
+  "polished_line": "<that turn rewritten stronger, or empty string>"
 }}
 """
 

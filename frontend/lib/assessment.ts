@@ -42,7 +42,8 @@ export interface SubmitResponseCompleted {
 
 export type SubmitResponseResult =
   | SubmitResponseInProgress
-  | SubmitResponseCompleted;
+  | SubmitResponseCompleted
+  | AssessmentProcessing;
 
 export interface SkillDetail {
   score: number;
@@ -63,6 +64,7 @@ export interface AssessmentSummary {
     fluency: SkillDetail;
     vocabulary: SkillDetail;
     pronunciation?: SkillDetail;
+    confidence: SkillDetail;
   };
   positive_framing: {
     title: string;
@@ -149,8 +151,16 @@ export function submitAssessmentResponse(
   });
 }
 
+export interface AssessmentProcessing {
+  status: "processing";
+  assessment_id: string;
+  message: string;
+}
+
 export function getResultsSummary(assessmentId: string) {
-  return api<AssessmentSummary>(`/assessment/${assessmentId}/summary`);
+  return api<AssessmentSummary | AssessmentProcessing>(
+    `/assessment/${assessmentId}/summary`,
+  );
 }
 
 // ── Feature-Access Gating (US-12) ────────────────────────────────────────────

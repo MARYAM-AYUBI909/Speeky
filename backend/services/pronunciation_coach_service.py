@@ -8,17 +8,28 @@ approach as interview_coach_service. Real audio scoring is NOT a stand-in here: 
 and retry submissions take a raw audio upload and run it through lib/recording_engine.py
 (STT + VAD + prosody), the same pipeline services/accent_assessment_service.py uses —
 word correctness comes from lib/recording_engine.classify_word_status, not a text diff.
+
+Also carries over from the original one-shot Pronunciation Coach (US-95), preserved
+here rather than dropped when the session architecture replaced it:
+  - ACC-US-01 Live Speech Verification: playback/replay detection + account
+    suspension, run on every attempt before scoring (_check_liveness).
+  - ACC-US-11 / ACC-US-09 Local Accent Calibration: word results are calibrated for
+    the user's accent/sub-dialect preference before being classified as errors
+    (_score_words).
+  - PRN-US-10 / PRN-US-11 "hear correct pronunciation" TTS playback
+    (get_word_pronunciation_audio) — standalone, no session state needed.
 """
 
+import base64
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import Depends, File, Form, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
-from lib import kv_store, recording_engine, text_alignment
+from lib import kv_store, recording_engine, text_alignment, tts_client
 from lib.audio_io import AudioDecodeError
 from lib.prompts import (
     CODE_SWITCH_PARTIAL_OVERLAP_CEILING,
@@ -40,7 +51,13 @@ from lib.recording_engine import RejectionReason
 from lib.speech_config import load_speech_config
 from lib.text_alignment import WordStatus
 from middlewares.auth_middleware import require_auth
-from schemas.pronunciation_schemas import DeviceScopedRequest, StartSessionRequest
+from schemas.pronunciation_schemas import (
+    DeviceScopedRequest,
+    RecordingRejectedSchema,
+    StartSessionRequest,
+    WordResultSchema,
+)
+from services import accent_calibration_service, liveness_service
 from utils.feature_errors import (
     InvalidSubmissionError,
     SessionAlreadyEndedError,
@@ -51,6 +68,10 @@ from utils.feature_errors import (
 
 NAMESPACE = "pronunciation_sessions"
 PHONEME_ORDER = list(SENTENCE_BANK.keys())
+
+# ── PRN-US-10 / PRN-US-11: "hear correct pronunciation" playback ────────────────
+_TTS_CACHE_NS = "pronunciation_tts_cache"
+_VALID_SPEEDS = ("normal", "slow")
 
 
 def _now() -> datetime:
@@ -82,6 +103,45 @@ def _analyze_upload(audio_bytes: bytes, config, initial_prompt: Optional[str] = 
         raise UnreadableAudioError(str(e))
 
 
+def _rejection_message(reason: RejectionReason) -> str:
+    return {
+        RejectionReason.NO_SPEECH_DETECTED: "No speech was detected in the recording. Please try again.",
+        RejectionReason.AUDIO_TOO_QUIET: "The recording is too quiet to analyze. Please move closer to the microphone.",
+        RejectionReason.BACKGROUND_NOISE_TOO_HIGH: "Background noise is too high to analyze. Please try again in a quieter environment.",
+        RejectionReason.INCOMPLETE_RECORDING: "The recording appears to be incomplete.",
+        RejectionReason.MULTIPLE_VOICES_DETECTED: "Multiple voices were detected in the recording.",
+        RejectionReason.AUDIO_DISTORTION: "Audio distortion detected. Please move farther from the microphone and try again.",
+    }[reason]
+
+
+async def _check_liveness(user_id: str, item_id: str, analysis: recording_engine.RecordingAnalysis, config) -> Optional[JSONResponse]:
+    """ACC-US-01 Live Speech Verification: suspension check + playback/replay
+    detection, shared by _submit_attempt and _retry_word so neither audio-submission
+    path in this session flow can bypass anti-cheat. Returns a 403/422 JSONResponse
+    if the submission must be rejected, else None."""
+    if await liveness_service.check_user_suspended(user_id):
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Accent assessment access temporarily suspended due to repeated playback flags (3+). Account routed to support review."},
+        )
+
+    playback_reason = recording_engine.detect_playback_audio(analysis, config)
+    if playback_reason is not None:
+        flag_info = await liveness_service.record_liveness_flag(
+            user_id=user_id, item_id=item_id, prompt_token=None, reason=playback_reason.value,
+        )
+        return JSONResponse(
+            status_code=422,
+            content=RecordingRejectedSchema(
+                reason=playback_reason.value,
+                message="Detected playback audio. Live speech required.",
+                appeal_token=flag_info["appeal_token"],
+                appeal_prompt=flag_info["appeal_prompt"],
+            ).model_dump(),
+        )
+    return None
+
+
 def _coverage_ratio(analysis: recording_engine.RecordingAnalysis, target_text: str) -> float:
     """Real matched-word ratio for off-script/code-switch gating. Deliberately NOT the
     same "matched" count lib/text_alignment.compute_passage_coverage uses (that counts
@@ -100,18 +160,34 @@ def _coverage_ratio(analysis: recording_engine.RecordingAnalysis, target_text: s
     return matched / len(aligned)
 
 
-def _score_words(analysis: recording_engine.RecordingAnalysis, target_text: str, config) -> List[Dict]:
-    """Real per-word correct/incorrect via the shared recording_engine classifier
-    (same one services/accent_assessment_service.py uses) — MISPRONOUNCED, STRESS_ERROR,
-    and SKIPPED all collapse to `correct=False` here, matching the boolean granularity
-    the existing session-flow (phoneme rotation, response shape) already expects."""
+async def _score_words(
+    analysis: recording_engine.RecordingAnalysis,
+    target_text: str,
+    config,
+    accent_preference: str,
+    sub_dialect_preference: Optional[str],
+) -> Tuple[List[Dict], Optional[str], str]:
+    """Real per-word status (correct/stress_error/mispronounced/skipped) via the shared
+    recording_engine classifier (same one services/accent_assessment_service.py and the
+    one-shot Pronunciation Coach both use), then calibrated for the user's accent/
+    sub-dialect preference (ACC-US-11/ACC-US-09) so a valid regional stress or phonetic
+    shift isn't counted as a genuine error. Returns (word dicts, calibration warning,
+    model actually used) — callers that only need pass/fail check `status == "correct"`."""
     aligned = recording_engine.align_to_sentence(analysis, target_text)
-    words = []
+    word_results = []
     for a in aligned:
         timing = analysis.words[a.transcript_index] if a.transcript_index is not None else None
         status = recording_engine.classify_word_status(a.target_word, timing, analysis.prosody, config)
-        words.append({"word": a.target_word, "correct": status == WordStatus.CORRECT})
-    return words
+        word_results.append(WordResultSchema(
+            word=a.target_word,
+            target_index=a.target_index,
+            status=status.value,
+            confidence=round(timing.probability, 3) if timing is not None else None,
+        ))
+    calibrated, warning, model_used = accent_calibration_service.calibrate_word_results(
+        word_results, accent_preference, sub_dialect_preference=sub_dialect_preference,
+    )
+    return [w.model_dump() for w in calibrated], warning, model_used
 
 
 def _next_sentence(session: dict, phoneme: str) -> str:
@@ -158,7 +234,7 @@ def _record_attempt(session: dict, message_key: str, words: List[Dict]) -> None:
     session["last_completed"] = {
         "phoneme": session["current_phoneme"],
         "sentence": session["current_sentence"],
-        "words": {w["word"]: w["correct"] for w in words},
+        "words": {w["word"]: w["status"] for w in words},
     }
 
 
@@ -190,7 +266,7 @@ async def _start_session(user_id: str, device_id: str) -> dict:
     return session
 
 
-async def _submit_attempt(user_id: str, session_id: str, audio_bytes: bytes) -> dict:
+async def _submit_attempt(user_id: str, session_id: str, audio_bytes: bytes):
     session = await _get_session(session_id, user_id)
     if session["status"] == "completed":
         raise SessionAlreadyEndedError("Cannot submit an attempt to a completed session")
@@ -200,6 +276,12 @@ async def _submit_attempt(user_id: str, session_id: str, audio_bytes: bytes) -> 
     # initial_prompt biases STT toward the sentence the user was asked to read — see
     # lib/stt_engine.transcribe's docstring for why this materially helps accuracy.
     analysis = _analyze_upload(audio_bytes, config, initial_prompt=sentence)
+
+    # ACC-US-01: liveness/playback-audio check, before any content scoring — replayed
+    # audio must never advance a session or update phoneme-accuracy stats.
+    rejection_response = await _check_liveness(user_id, session_id, analysis, config)
+    if rejection_response is not None:
+        return rejection_response
 
     session["last_active_at"] = _now()
     transcript = analysis.transcript or ""
@@ -224,6 +306,10 @@ async def _submit_attempt(user_id: str, session_id: str, audio_bytes: bytes) -> 
         }
 
     session["consecutive_silent"] = 0
+
+    # ACC-US-11 / ACC-US-09: fetch once per attempt, applied inside _score_words to
+    # every branch below so a genuine regional accent never gets marked as an error.
+    accent_preference, sub_dialect_preference, _ = await accent_calibration_service.get_user_accent_preference(user_id)
 
     # GAP-05: off-script / code-switch detection, via real alignment coverage against
     # the full target sentence (lib/text_alignment.align_words under the hood).
@@ -250,30 +336,32 @@ async def _submit_attempt(user_id: str, session_id: str, audio_bytes: bytes) -> 
     # plain mispronunciation. (A single wrong English word just gets marked incorrect below.)
     # Never a clean full read, so it never advances — same sentence again, whole thing.
     if _has_non_english_word(transcript) and coverage < CODE_SWITCH_PARTIAL_OVERLAP_CEILING:
-        words = _score_words(analysis, attempted_sentence, config)
+        words, warning, model_used = await _score_words(analysis, attempted_sentence, config, accent_preference, sub_dialect_preference)
         _record_attempt(session, "code_switch_partial", words)
         await kv_store.store.update(NAMESPACE, session_id, session)
         return {
             "session_id": session_id, "message_key": "code_switch_partial",
             "message": PRONUNCIATION_MESSAGES["code_switch_partial"], "words": words, "transcript": transcript,
+            "accent_profile": model_used, "warning": warning, "model_used": model_used,
         }
 
     # Cut off mid-sentence but what came through was on-script: mark scored words only.
     # Incomplete either way, so it never advances — same sentence again, whole thing.
     if transcript_word_count < sentence_word_count * 0.6:
-        words = _score_words(analysis, attempted_sentence, config)
+        words, warning, model_used = await _score_words(analysis, attempted_sentence, config, accent_preference, sub_dialect_preference)
         _record_attempt(session, "partial_muted", words)
         await kv_store.store.update(NAMESPACE, session_id, session)
         return {
             "session_id": session_id, "message_key": "partial_muted",
             "message": PRONUNCIATION_MESSAGES["partial_muted"], "words": words, "transcript": transcript,
+            "accent_profile": model_used, "warning": warning, "model_used": model_used,
         }
 
     # Only a fully correct read of the whole sentence advances. Any word wrong -> same
     # sentence again in full, no per-word retry — _advance (phoneme rotation, new
     # sentence) only runs on a clean pass.
-    words = _score_words(analysis, sentence, config)
-    had_error = any(not w["correct"] for w in words)
+    words, warning, model_used = await _score_words(analysis, sentence, config, accent_preference, sub_dialect_preference)
+    had_error = any(w["status"] != WordStatus.CORRECT.value for w in words)
     message_key = "needs_retry" if had_error else "scored_ok"
     _record_attempt(session, message_key, words)
     if had_error:
@@ -281,6 +369,7 @@ async def _submit_attempt(user_id: str, session_id: str, audio_bytes: bytes) -> 
         return {
             "session_id": session_id, "message_key": "needs_retry",
             "message": PRONUNCIATION_MESSAGES["needs_retry"], "words": words, "transcript": transcript,
+            "accent_profile": model_used, "warning": warning, "model_used": model_used,
         }
 
     _advance(session, False)
@@ -290,10 +379,11 @@ async def _submit_attempt(user_id: str, session_id: str, audio_bytes: bytes) -> 
         "message": PRONUNCIATION_MESSAGES["scored_ok"], "words": words, "transcript": transcript,
         "next_sentence": session["current_sentence"], "next_phoneme": session["current_phoneme"],
         "next_phoneme_tag": build_phoneme_tag(session["current_phoneme"]),
+        "accent_profile": model_used, "warning": warning, "model_used": model_used,
     }
 
 
-async def _retry_word(user_id: str, session_id: str, target_word: str, audio_bytes: bytes) -> dict:
+async def _retry_word(user_id: str, session_id: str, target_word: str, audio_bytes: bytes):
     session = await _get_session(session_id, user_id)
     last = session.get("last_completed")
     target = target_word.lower().strip()
@@ -305,6 +395,13 @@ async def _retry_word(user_id: str, session_id: str, target_word: str, audio_byt
     # single-word clips have the least context of any audio this pipeline handles, so
     # this is where prompt-biasing helps recognition accuracy the most.
     analysis = _analyze_upload(audio_bytes, config, initial_prompt=target)
+
+    # ACC-US-01: same liveness/playback-audio gate as the main attempt path — a
+    # replayed clip must not be able to "fix" a word via retry either.
+    rejection_response = await _check_liveness(user_id, session_id, analysis, config)
+    if rejection_response is not None:
+        return rejection_response
+
     session["last_active_at"] = _now()
 
     # E-03: empty/too-short audio is rejected outright — real recording duration/VAD,
@@ -316,15 +413,24 @@ async def _retry_word(user_id: str, session_id: str, target_word: str, audio_byt
             "frustration_breakdown": False, "transcript": analysis.transcript or "",
         }
 
+    accent_preference, sub_dialect_preference, _ = await accent_calibration_service.get_user_accent_preference(user_id)
     aligned = recording_engine.align_to_sentence(analysis, target)
     timing = None
     if aligned and aligned[0].transcript_index is not None:
         timing = analysis.words[aligned[0].transcript_index]
     status = recording_engine.classify_word_status(target, timing, analysis.prosody, config)
-    new_correct = status == WordStatus.CORRECT
+    word_result = WordResultSchema(
+        word=target, target_index=0, status=status.value,
+        confidence=round(timing.probability, 3) if timing is not None else None,
+    )
+    calibrated, _warning, _model_used = accent_calibration_service.calibrate_word_results(
+        [word_result], accent_preference, sub_dialect_preference=sub_dialect_preference,
+    )
+    new_status = calibrated[0].status
+    new_correct = new_status == WordStatus.CORRECT.value
 
-    was_correct = last["words"][target]
-    last["words"][target] = new_correct
+    was_status = last["words"][target]
+    last["words"][target] = new_status
 
     fail_counts = session.setdefault("retry_fail_counts", {})
     if new_correct:
@@ -336,7 +442,7 @@ async def _retry_word(user_id: str, session_id: str, target_word: str, audio_byt
     if frustration:
         message = RETRY_MESSAGES["frustration_breakdown"]
     else:
-        fixed_word = target if (new_correct and not was_correct) else None
+        fixed_word = target if (new_correct and was_status != WordStatus.CORRECT.value) else None
         broken_word = target if not new_correct else None
         message = build_retry_diff_message(fixed_word, broken_word)
 
@@ -402,7 +508,7 @@ async def _end_session(user_id: str, session_id: str) -> dict:
         entry = by_phoneme.setdefault(attempt["phoneme"], {"attempts": 0, "correct_words": 0, "total_words": 0})
         entry["attempts"] += 1
         entry["total_words"] += len(attempt["words"])
-        entry["correct_words"] += sum(1 for w in attempt["words"] if w["correct"])
+        entry["correct_words"] += sum(1 for w in attempt["words"] if w["status"] == WordStatus.CORRECT.value)
 
     return {
         "session_id": session_id, "status": session["status"],
@@ -488,3 +594,58 @@ async def end_session(session_id: str, user_id: str = Depends(require_auth)):
 
 async def get_session(session_id: str, user_id: str = Depends(require_auth)):
     return await _get_session_snapshot(user_id, session_id)
+
+
+# ── PRN-US-10 / PRN-US-11: "hear correct pronunciation" playback (standalone,
+# no session state needed — kept unchanged from the original one-shot coach) ────
+def _tts_cache_key(word: str, speed: str) -> str:
+    return f"{word.strip().lower()}::{speed}"
+
+
+async def _get_cached_audio(word: str, speed: str, ttl_seconds: int) -> Optional[bytes]:
+    entry = await kv_store.store.get(_TTS_CACHE_NS, _tts_cache_key(word, speed))
+    if entry is None:
+        return None
+    cached_at: datetime = entry["cached_at"]
+    age = (datetime.now(timezone.utc) - cached_at).total_seconds()
+    if age > ttl_seconds:
+        return None
+    return base64.b64decode(entry["audio_b64"])
+
+
+async def _store_cached_audio(word: str, speed: str, audio: bytes) -> None:
+    key = _tts_cache_key(word, speed)
+    value = {"audio_b64": base64.b64encode(audio).decode("ascii"), "cached_at": datetime.now(timezone.utc)}
+    if await kv_store.store.get(_TTS_CACHE_NS, key) is None:
+        await kv_store.store.create(_TTS_CACHE_NS, key, value)
+    else:
+        await kv_store.store.update(_TTS_CACHE_NS, key, value)
+
+
+async def get_word_pronunciation_audio(word: str, speed: str = "normal", user_id: str = Depends(require_auth)):
+    """Correct-pronunciation playback for a single word/short phrase — fires when the
+    user taps a mispronounced word (PRN-US-10, speed=normal) or when the retry loop
+    hits PRN-US-11's E-01 exception and offers a slow breakdown instead (speed=slow).
+    `word` is reused as-is from a word result the client already has; no server-side
+    retry-streak tracking is added here, that stays a frontend concern."""
+    if speed not in _VALID_SPEEDS:
+        raise InvalidSubmissionError(f"speed must be one of {_VALID_SPEEDS}")
+
+    config = load_speech_config()
+    cached = await _get_cached_audio(word, speed, config.pronunciation_tts_cache_ttl_seconds)
+    if cached is not None:
+        return Response(content=cached, media_type="audio/wav")
+
+    if not tts_client.is_configured():
+        return JSONResponse(status_code=503, content={
+            "error": "TTS engine unavailable. Fall back to your device's native text-to-speech.",
+        })
+
+    length_scale = 1.0 if speed == "normal" else config.pronunciation_tts_slow_length_scale
+    try:
+        audio = tts_client.synthesize(word, length_scale=length_scale)
+    except tts_client.TTSError as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+
+    await _store_cached_audio(word, speed, audio)
+    return Response(content=audio, media_type="audio/wav")

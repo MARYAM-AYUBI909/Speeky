@@ -343,7 +343,7 @@ async def submit_response(
     )
 
     if new_index >= len(assessment.questionIds):
-        return await _complete_assessment(updated)
+        return await _try_complete_assessment(updated)
 
     next_question = _question_bank.get_by_id(assessment.questionIds[new_index])
     return {
@@ -353,6 +353,27 @@ async def submit_response(
         "next_question_mode": _question_bank.get_question_mode(next_question) if next_question else None,
         "previous_result": processing_result,
     }
+
+
+async def _try_complete_assessment(assessment: BaselineAssessment) -> Dict:
+    """BAS-US-01 E-02: responses are already durably saved by the time this runs (the
+    caller persists them before invoking completion), so a scoring failure here — a
+    confidence-engine bug, a transient DB error — must not strand the user with no way
+    forward. Flag the row for retry instead of raising, so a later call (background
+    job or the next /summary request) can pick up scoring again from saved responses."""
+    try:
+        return await _complete_assessment(assessment)
+    except Exception:
+        logger.exception(f"Scoring failed for assessment {assessment.id}; flagging for retry")
+        await db.baselineassessment.update(
+            where={"id": assessment.id},
+            data={"scoringFailed": True},
+        )
+        return {
+            "status": "processing",
+            "assessment_id": assessment.id,
+            "message": "Your responses are saved and your results are still processing. Check back shortly.",
+        }
 
 
 async def _complete_assessment(assessment: BaselineAssessment) -> Dict:
@@ -403,6 +424,7 @@ async def _complete_assessment(assessment: BaselineAssessment) -> Dict:
         where={"id": assessment.id},
         data={
             "completedAt": completed_at,
+            "scoringFailed": False,
             "fluencyScore": avg_fluency,
             "vocabularyScore": avg_vocabulary,
             "pronunciationScore": avg_pronunciation,
@@ -460,8 +482,9 @@ async def get_assessment_status(assessment_id: str, user_id: str = Depends(requi
         }
 
     elapsed = (datetime.now(timezone.utc) - assessment.startedAt).total_seconds()
+    all_answered = assessment.currentIndex >= len(assessment.questionIds)
     return {
-        "status": "in_progress",
+        "status": "processing" if (all_answered and assessment.scoringFailed) else "in_progress",
         "current_question_index": assessment.currentIndex,
         "total_questions": len(assessment.questionIds),
         "elapsed_seconds": elapsed,
@@ -516,6 +539,11 @@ def _skill_description(skill: str, score: float) -> str:
             "medium": "Your pronunciation is generally clear with some areas to refine.",
             "developing": "Working on clarity and accuracy in pronunciation.",
         },
+        "confidence": {
+            "high": "You come across as self-assured and composed.",
+            "medium": "You're showing steady confidence with room to grow.",
+            "developing": "Building your confidence one session at a time.",
+        },
     }
     tier = "high" if score >= 70 else "medium" if score >= 50 else "developing"
     return descriptions[skill][tier]
@@ -555,6 +583,15 @@ def _skill_breakdown(assessment: BaselineAssessment) -> Dict:
             "description": _skill_description("pronunciation", assessment.pronunciationScore),
             "strength": _skill_strength(assessment.pronunciationScore),
         }
+    # BAS-US-01 AC: breakdown must cover Fluency/Vocabulary/Pronunciation/Confidence —
+    # Confidence as its own row here, distinct from the separate top-line score above.
+    breakdown["confidence"] = {
+        "score": assessment.confidenceScore,
+        "display": f"{assessment.confidenceScore:.1f}/100",
+        "label": "Confidence",
+        "description": _skill_description("confidence", assessment.confidenceScore),
+        "strength": _skill_strength(assessment.confidenceScore),
+    }
     return breakdown
 
 
@@ -590,7 +627,16 @@ async def get_results_summary(assessment_id: str, user_id: str = Depends(require
     if not assessment or assessment.userId != user_id:
         return JSONResponse(status_code=404, content={"error": "Assessment not found"})
     if not assessment.completedAt:
-        return JSONResponse(status_code=400, content={"error": "Assessment not completed"})
+        # BAS-US-01 E-02: all responses are in but a prior scoring attempt failed (or
+        # this is the first attempt reaching a fully-answered assessment) — retry
+        # scoring now instead of flatly 400ing forever.
+        if assessment.currentIndex >= len(assessment.questionIds):
+            retry_result = await _try_complete_assessment(assessment)
+            if retry_result.get("status") == "processing":
+                return JSONResponse(status_code=202, content=retry_result)
+            assessment = await db.baselineassessment.find_unique(where={"id": assessment_id})
+        else:
+            return JSONResponse(status_code=400, content={"error": "Assessment not completed"})
 
     user = await db.user.find_unique(where={"id": user_id})
 

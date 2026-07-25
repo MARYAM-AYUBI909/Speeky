@@ -6,6 +6,8 @@ import { LogOut } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Sidebar } from "@/components/dashboard/Sidebar";
 import { AssessmentReminderBanner } from "@/components/dashboard/AssessmentReminderBanner";
+import { PendingNotificationsBanner } from "@/components/dashboard/PendingNotificationsBanner";
+import { OveruseNudgeBanner } from "@/components/dashboard/OveruseNudgeBanner";
 import { useAuth } from "@/contexts/AuthContext";
 import { AssessmentProvider } from "@/contexts/AssessmentContext";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
@@ -55,6 +57,8 @@ export default function DashboardLayout({
 
           <main className="relative flex-1 px-6 py-8 lg:px-10">
             <AssessmentReminderBanner />
+            <PendingNotificationsBanner />
+            <OveruseNudgeBanner />
             {children}
           </main>
         </div>

@@ -64,6 +64,7 @@ enum AccentAssessmentStatus {
   REJECTED_TOO_NOISY
   REJECTED_INCOMPLETE
   REJECTED_MULTIPLE_VOICES
+  REJECTED_DISTORTION
 }
 
 // Public Speaking Coach speech types (PSC-US-01, PSC-US-03, PSC-US-04, PSC-US-05, PSC-US-06, PSC-US-07)
@@ -79,16 +80,16 @@ enum AccentAssessmentStatus {
 // Values: in_progress, completed, qa_phase
 
 model User {
-  id                     String                    @id @default(cuid())
-  email                  String                    @unique
+  id                     String                   @id @default(cuid())
+  email                  String                   @unique
   password               String
   name                   String
-  avatarUrl              String                    @default("user.webp")
-  role                   Role                      @default(USER)
-  assessmentStatus       AssessmentStatus          @default(UNASSESSED)
+  avatarUrl              String                   @default("user.webp")
+  role                   Role                     @default(USER)
+  assessmentStatus       AssessmentStatus         @default(UNASSESSED)
   learningLevel          LearningLevel?
-  createdAt              DateTime                  @default(now())
-  updatedAt              DateTime                  @updatedAt
+  createdAt              DateTime                 @default(now())
+  updatedAt              DateTime                 @updatedAt
   passwordResetTokens    PasswordResetToken[]
   refreshTokens          RefreshToken[]
   baselineAssessments    BaselineAssessment[]
@@ -101,6 +102,12 @@ model User {
   accentProfiles         AccentProfile[]
   vocabularyProgress     VocabularyWordProgress[]
   publicSpeakingSessions PublicSpeakingSession[]
+  // US-80/US-90/ACC-US-09: Live Speech Verification & Local Accent Calibration (Sub-Dialects)
+  livenessFlags          LivenessFlag[]
+  accentModelPreference  String                   @default("generic_global")
+  subDialectPreference   String?
+  livenessFlagCount      Int                      @default(0)
+  isAccentSuspended      Boolean                  @default(false)
 
   // PDG-US-15: lifetime cumulative practice time (seconds) credited via
   // practice_time_service pings, and the milestone-hour thresholds already
@@ -151,21 +158,20 @@ model ScenarioSession {
 // separate grading pass. needsReview flags a Mastered word that was targeted
 // again in a later session but not used (E-03 de-ranking).
 model VocabularyWordProgress {
-  id           String    @id @default(cuid())
-  userId       String
-  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  word         String
-  useCount     Int       @default(0)
-  status       String    @default("learning") // learning | mastered
-  needsReview  Boolean   @default(false)
-  lastUsedAt   DateTime  @default(now())
-  createdAt    DateTime  @default(now())
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  word        String
+  useCount    Int      @default(0)
+  status      String   @default("learning") // learning | mastered
+  needsReview Boolean  @default(false)
+  lastUsedAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
 
   @@unique([userId, word])
   @@index([userId, status])
   @@map("vocabulary_word_progress")
 }
-
 
 // Admin-authored Scenario-Based Learning scenarios. Merged with the
 // built-in lib/prompts.SBL_SCENARIOS at read time. Publishing is just a DB write —
@@ -239,6 +245,15 @@ model BaselineAssessment {
   flagReason         String?
   startedAt          DateTime       @default(now())
   completedAt        DateTime?
+  // BAS-US-01 E-02: set when _complete_assessment's scoring step throws after all
+  // responses are already saved — completedAt stays null so the row still reads as
+  // "in progress" everywhere else, but get_results_summary uses this flag to retry
+  // scoring instead of returning a flat "not completed" 400 forever.
+  scoringFailed      Boolean        @default(false)
+  // PDG-US-10 E-03: distinct from isFlagged/flagReason (integrity checks on the
+  // responses themselves) — records when progress_dashboard_service drops an
+  // out-of-range (>100 or <0) score from the visual aggregate, for review.
+  outlierFlags       Json           @default("[]")
 
   // Every gating/reassessment/trend query filters userId then sorts or filters on completedAt
   @@index([userId, completedAt])
@@ -258,7 +273,7 @@ model PronunciationAttempt {
   transcript              String
   wordResults             Json // [{word, target_index, status, confidence}]
   overallScore            Float
-  accentProfileTag        String? // US-90 Local Accent Calibration hook (stub — not applied yet)
+  accentProfileTag        String? // US-90 Local Accent Calibration hook
   attemptCount            Int      @default(1)
   backgroundVoiceDetected Boolean  @default(false)
   disfluencyDetected      Boolean  @default(false)
@@ -419,9 +434,30 @@ model PublicSpeakingSession {
   aiQuestion     String? // AI-generated Q&A question (PSC-US-12)
   userQaResponse String? // User's Q&A response
   qaScore        Json? // Q&A performance evaluation
+  audioFeatures  Json? // AUDIO pipeline signal snapshot (word_timings etc.) — PSC-US-08
+  outlierFlags   Json      @default("[]") // PDG-US-10 E-03: out-of-range scorecard scores dropped from dashboard aggregates
   createdAt      DateTime  @default(now())
   completedAt    DateTime?
 
   @@index([userId, completedAt])
   @@map("public_speaking_sessions")
+}
+
+// US-80: Live Speech Verification (ACC-US-01). One row per flag raised against a user's
+// submission. Repeated flags (3+) trigger temporary suspension (isAccentSuspended on User).
+// appealed/appealPassed track the E-02 false-positive appeal workflow.
+model LivenessFlag {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  passageId    String?
+  sentenceId   String?
+  promptToken  String?
+  reason       String
+  appealed     Boolean  @default(false)
+  appealPassed Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("liveness_flags")
 }

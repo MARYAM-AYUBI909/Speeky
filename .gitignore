@@ -6,10 +6,18 @@ tests/
 
 uploads/*
 __pycache__/
-*.env.
+**/.env
 *.env.*
 *.zip
+Dockerfile*
+.dockerignore
+*.docx
 
 !.env.example
 !uploads/avatars/
 !uploads/avatars/user.webp
+
+output
+venv
+.claude
+.devin2

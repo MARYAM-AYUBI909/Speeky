@@ -2,15 +2,18 @@
 
 import * as React from "react";
 import { useParams, useRouter } from "next/navigation";
-import { Coffee, Pause, Play, Share2, Sparkles } from "lucide-react";
+import { Coffee, Mic, MicOff, Pause, Play, Share2, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Modal } from "@/components/ui/modal";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
+import { useAutoScroll } from "@/lib/useAutoScroll";
+import { useLiveKitVoice } from "@/lib/useLiveKitVoice";
 import {
   endInterviewSession,
+  getInterviewCoachVoiceToken,
   pauseInterviewSession,
   resumeInterviewSession,
   shareInterviewReview,
@@ -41,6 +44,7 @@ export default function InterviewCoachSessionPage() {
 
   const [mode, setMode] = React.useState<InterviewMode>("standard");
   const [turns, setTurns] = React.useState<Turn[]>([]);
+  const scrollRef = useAutoScroll(turns.length);
   const [allFlags, setAllFlags] = React.useState<string[]>([]);
   const [answer, setAnswer] = React.useState("");
   const [status, setStatus] = React.useState<"active" | "paused">("active");
@@ -59,6 +63,29 @@ export default function InterviewCoachSessionPage() {
   React.useEffect(() => {
     answerRef.current = answer;
   }, [answer]);
+
+  // Voice mode: same LiveKit mic-in pattern as Conversation/Scenarios/Coaching —
+  // transcript fills the answer input for the user to review/edit, never auto-sent.
+  const fetchVoiceToken = React.useCallback(
+    () => getInterviewCoachVoiceToken(sessionId),
+    [sessionId],
+  );
+  const onTranscript = React.useCallback((text: string) => {
+    if (!firstKeystrokeAt.current) firstKeystrokeAt.current = Date.now();
+    setAnswer((prev) => (prev.trim() ? `${prev.trim()} ${text}` : text));
+  }, []);
+  const {
+    isVoiceActive,
+    isConnectingVoice,
+    isStoppingVoice,
+    voiceStatus,
+    error: voiceError,
+    startVoice,
+    stopVoice,
+  } = useLiveKitVoice(fetchVoiceToken, onTranscript);
+  React.useEffect(() => {
+    if (voiceError) setError(voiceError);
+  }, [voiceError]);
 
   // Rehydrate from sessionStorage (no GET-session endpoint exists to refetch
   // from the backend on reload — see lib/interviewCoach.ts).
@@ -119,6 +146,7 @@ export default function InterviewCoachSessionPage() {
   }, [sessionId]);
 
   async function finishSession() {
+    if (isVoiceActive) await stopVoice();
     setIsEnding(true);
     try {
       const result = await endInterviewSession(sessionId);
@@ -184,6 +212,7 @@ export default function InterviewCoachSessionPage() {
   async function handlePauseResume() {
     try {
       if (status === "active") {
+        if (isVoiceActive) await stopVoice();
         await pauseInterviewSession(sessionId);
         setStatus("paused");
       } else {
@@ -238,7 +267,7 @@ export default function InterviewCoachSessionPage() {
       ) : null}
 
       <div className="flex flex-col gap-4 rounded-2xl border border-border bg-surface-elevated p-6 shadow-sm">
-        <div className="flex max-h-[55vh] flex-col gap-4 overflow-y-auto">
+        <div ref={scrollRef} className="flex max-h-[55vh] flex-col gap-4 overflow-y-auto">
           {turns.map((turn, i) => (
             <div key={i} className="flex flex-col gap-2">
               <div className="max-w-[85%]">
@@ -290,8 +319,34 @@ export default function InterviewCoachSessionPage() {
             <Button size="md" loading={isSubmitting} disabled={!answer.trim()} onClick={handleSubmitAnswer}>
               Send
             </Button>
+            {isVoiceActive ? (
+              <Button
+                size="md"
+                variant="outline"
+                loading={isStoppingVoice}
+                onClick={() => void stopVoice()}
+              >
+                <MicOff className="h-4 w-4" aria-hidden="true" />
+                Stop Voice
+              </Button>
+            ) : (
+              <Button
+                size="md"
+                variant="outline"
+                loading={isConnectingVoice}
+                onClick={() => void startVoice()}
+              >
+                <Mic className="h-4 w-4" aria-hidden="true" />
+                Start Voice
+              </Button>
+            )}
           </div>
         )}
+        {voiceStatus ? (
+          <p role="status" aria-live="polite" className="text-sm text-muted-foreground">
+            {voiceStatus}
+          </p>
+        ) : null}
       </div>
     </div>
   );

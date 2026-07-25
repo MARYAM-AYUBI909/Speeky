@@ -1,345 +1,304 @@
-"""
-Accent Assessment — US-82 (ACC-US-03 Target Accent Selection),
-US-83 (ACC-US-04 Score Dispute), US-84 (ACC-US-05 Profile Staleness).
+"""Accent Assessment — Rhythm & Stress Patterns (US-93): read a longer passage aloud,
+get 4 separate dimension scores (pronunciation, stress pattern, rhythm, intonation,
+clarity) plus weak-point detection. Built on lib/recording_engine.py (Story #1) and
+reuses lib/recording_engine.classify_word_status — the same per-word classification
+Pronunciation Coach uses — rather than a second copy of that logic.
 
-Thin controller layer over lib/accent_assessment/, which already implements
-all three stories' rules against one shared substrate
-(AccentProfilePipelineService / AccentProfile / AccentAssessmentResult in
-profile_pipeline.py). Combined into one router+service, matching how the
-lib layer itself is organised as a single subpackage sharing that pipeline,
-rather than three near-duplicate router/service pairs each re-reading the
-same AccentProfile.
-
-Where the real data comes from:
-This backend never stores raw audio (see conversation_service.py's module
-docstring), so there is no dedicated "read this sentence aloud, get an
-accent baseline" recording flow yet. Rather than fabricate scores, baselines
-and drills here are derived from a user's own completed AI Conversation
-Practice sessions' real fluency/vocabulary/pronunciation scores
-(session_scorer.py, already computed at conversation-end):
-  * record_conversation_drill() is called (best-effort) by
-    conversation_service._end_session() every time a session ends — this
-    keeps AccentProfile.drills_history populated with genuinely-scored data
-    and, on a user's very first conversation, establishes their initial
-    timestamped baseline so staleness tracking has a real starting point.
-  * The explicit "retake a quick baseline" action (POST /rebaseline) reuses
-    a specific completed session's real scores rather than accepting
-    client-supplied numbers, which would otherwise let a client fabricate
-    its own score.
-
-Honest limitation: because conversation sessions never have real audio
-attached (audio_clip_id is set to the session_id purely for
-correlation/dispute-linking, is_audio_available is always False), every
-dispute against a conversation-derived assessment will hit score_dispute.py's
-E-03 "audio no longer available" path today. E-01 (high-volume auto-flag)
-and E-02 (daily rate limit) are unaffected by that and fully exercise real
-code. See the final summary for how to get the E-03-free happy path once a
-real audio-backed assessment type exists.
+A completed assessment automatically generates an Accent Profile (US-89) via
+services/accent_profile_service.py.
 """
 
+import json
 import logging
+import random
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
-from fastapi import Depends
+from fastapi import Depends, File, UploadFile
 from fastapi.responses import JSONResponse
+from prisma import Json
 
-from lib.accent_assessment.accent_profile_staleness import AccentProfileStalenessService
-from lib.accent_assessment.profile_pipeline import (
-    AccentAssessmentResult,
-    AccentProfile,
-    AccentProfilePipelineService,
-    ScoredMetric,
-    calculate_overall_accent_score,
-)
-from lib.accent_assessment.score_dispute import ScoreDisputeService
-from lib.accent_assessment.target_accent_selection import TargetAccentSelectionService
+from lib import prosody_engine, recording_engine, text_alignment
+from lib.audio_io import AudioDecodeError
+from lib.prisma_client import db
+from lib.recording_engine import RecordingAnalysis, RejectionReason
+from lib.speech_config import SpeechConfig, load_speech_config
+from lib.text_alignment import AlignedWord, WordStatus
 from middlewares.auth_middleware import require_auth
-from schemas.accent_assessment_schemas import (
-    RebaselineSchema,
-    SelectTargetAccentSchema,
-    SubmitDisputeSchema,
+from services.voice_consent_service import ensure_voice_consent
+from prisma.enums import AccentAssessmentStatus
+from schemas.accent_schemas import (
+    AccentAssessmentResultSchema,
+    RecordingRejectedSchema,
+    TargetPassageSchema,
+    WeakPointSchema,
 )
+from utils.feature_errors import PassageNotFoundError, UnreadableAudioError, UploadTooLargeError
 
 logger = logging.getLogger(__name__)
 
-# Module-level singletons — same lazy-kv_store-backed pattern as the lib
-# services themselves (each defaults `store` to lib.kv_store.store, the
-# real Prisma-backed KvEntry table, so this is real persistence, not
-# in-memory-only).
-_pipeline_service = AccentProfilePipelineService()
-_staleness_service = AccentProfileStalenessService(pipeline_service=_pipeline_service)
-_dispute_service = ScoreDisputeService()
-_target_accent_service = TargetAccentSelectionService()
+_REJECTION_TO_STATUS = {
+    RejectionReason.NO_SPEECH_DETECTED: AccentAssessmentStatus.REJECTED_NO_SPEECH,
+    RejectionReason.AUDIO_TOO_QUIET: AccentAssessmentStatus.REJECTED_TOO_QUIET,
+    RejectionReason.BACKGROUND_NOISE_TOO_HIGH: AccentAssessmentStatus.REJECTED_TOO_NOISY,
+    RejectionReason.INCOMPLETE_RECORDING: AccentAssessmentStatus.REJECTED_INCOMPLETE,
+    RejectionReason.MULTIPLE_VOICES_DETECTED: AccentAssessmentStatus.REJECTED_MULTIPLE_VOICES,
+}
 
-DEFAULT_TARGET_ACCENT_ID = "general_american"
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-# ── shared helpers ──────────────────────────────────────────────────────────
-async def _current_target_accent_id(user_id: str) -> str:
-    pref = await _target_accent_service.get_preference(user_id)
-    return pref.current_accent_id if pref else DEFAULT_TARGET_ACCENT_ID
+_REJECTION_MESSAGES = {
+    RejectionReason.NO_SPEECH_DETECTED: "No speech was detected in the recording. Please try again.",
+    RejectionReason.AUDIO_TOO_QUIET: "The recording is too quiet to analyze. Please move closer to the microphone.",
+    RejectionReason.BACKGROUND_NOISE_TOO_HIGH: "Background noise is too high to analyze. Please try again in a quieter environment.",
+    RejectionReason.INCOMPLETE_RECORDING: "The reading appears incomplete — please read the entire passage in one take.",
+    RejectionReason.MULTIPLE_VOICES_DETECTED: "Multiple voices were detected in the recording. Please record alone in a quiet space.",
+}
 
 
-def _find_assessment(profile: AccentProfile, assessment_id: str) -> Optional[AccentAssessmentResult]:
-    for res in profile.baselines_history + profile.drills_history:
-        if res.assessment_id == assessment_id:
-            return res
-    return None
+class PassageBank:
+    def __init__(self):
+        path = Path(__file__).parent.parent / "data" / "accent_passages.json"
+        with open(path, "r", encoding="utf-8") as f:
+            raw: Dict[str, List[dict]] = json.load(f)
+        self._by_id = {p["passage_id"]: p for passages in raw.values() for p in passages}
+        self._all = list(self._by_id.values())
+
+    def get_by_id(self, passage_id: str) -> Optional[dict]:
+        return self._by_id.get(passage_id)
+
+    def random(self, difficulty: Optional[str] = None) -> dict:
+        pool = [p for p in self._all if p["difficulty"] == difficulty] if difficulty else self._all
+        return random.choice(pool or self._all)
 
 
-# ── US-82 / ACC-US-03: Target Accent Selection ──────────────────────────────
-async def list_target_accents(user_id: str) -> Dict:
-    return {"accents": [a.__dict__ for a in _target_accent_service.registry.list_options()]}
+_passage_bank = PassageBank()
 
 
-async def get_target_accent(user_id: str) -> Dict:
-    pref = await _target_accent_service.get_preference(user_id)
-    if pref is None:
-        return {"current_accent_id": None, "history": []}
-    return {
-        "current_accent_id": pref.current_accent_id,
-        "history": [e.__dict__ for e in pref.history],
-    }
-
-
-async def select_target_accent(user_id: str, payload: SelectTargetAccentSchema) -> Dict:
-    result = await _target_accent_service.select_target_accent(
-        user_id, payload.accent_id, local_calibration_active=payload.local_calibration_active,
-    )
-    return {
-        "accent": result.accent.__dict__,
-        "requested_accent_id": result.requested_accent_id,
-        "was_unsupported_request": result.was_unsupported_request,
-        "fallback_message": result.fallback_message,
-        "confirmation_message": result.confirmation_message,
-        "is_mid_history_switch": result.is_mid_history_switch,
-    }
-
-
-# ── shared profile read (feeds US-84's UI + US-83's dispute picker) ────────
-async def get_profile(user_id: str) -> Dict:
-    profile = await _pipeline_service.get_profile(user_id)
-    if profile is None:
-        return {"has_profile": False, "baselines_history": [], "drills_history": []}
-    return {
-        "has_profile": True,
-        "target_accent_id": profile.target_accent_id,
-        "created_at": profile.created_at.isoformat(),
-        "last_assessment_at": profile.last_assessment_at.isoformat(),
-        "dismiss_count": profile.dismiss_count,
-        "is_reset_baseline": profile.is_reset_baseline,
-        "baselines_history": [_assessment_summary(b) for b in profile.baselines_history],
-        "drills_history": [_assessment_summary(d) for d in profile.drills_history],
-    }
-
-
-def _assessment_summary(res: AccentAssessmentResult) -> Dict:
-    return {
-        "assessment_id": res.assessment_id,
-        "timestamp": res.timestamp.isoformat(),
-        "overall_score": res.overall_score,
-        "metrics": {k: v.score for k, v in res.metrics.items()},
-        "assessment_type": res.assessment_type,
-        "is_historical": res.is_historical,
-        "is_audio_available": res.is_audio_available,
-        "notice": res.notice,
-    }
-
-
-# ── US-84 / ACC-US-05: Profile Staleness & Re-Baseline ──────────────────────
-async def check_staleness(user_id: str) -> Dict:
-    details = await _staleness_service.check_staleness_on_login(user_id)
-    return {
-        "profile_age_days": details.profile_age_days,
-        "is_stale": details.is_stale,
-        "should_prompt": details.should_prompt,
-        "prompt_message": details.prompt_message,
-        "prompt_frequency": details.prompt_frequency,
-        "suggested_rebaseline_type": details.suggested_rebaseline_type,
-        "notice": details.notice,
-        "last_assessment_at": details.last_assessment_at.isoformat() if details.last_assessment_at else None,
-    }
-
-
-async def dismiss_staleness_prompt(user_id: str) -> Dict:
-    profile = await _staleness_service.dismiss_prompt(user_id)
-    return {"dismiss_count": profile.dismiss_count, "last_dismissed_at": profile.last_dismissed_at.isoformat()}
-
-
-async def rebaseline(user_id: str, payload: RebaselineSchema) -> Dict:
-    """
-    US-84 happy path: "retake a quick baseline". Reuses a specific
-    completed conversation session's real scores (never a client-supplied
-    number) as the new baseline's metrics, so this can't be used to fake a
-    score. Never overwrites `baselines_history` (execute_rebaseline appends).
-    """
-    from lib import kv_store
-    from services import conversation_service
-
-    session = await kv_store.store.get(conversation_service.NAMESPACE, payload.session_id)
-    if session is None or session["user_id"] != user_id:
-        return JSONResponse(status_code=404, content={"error": f"Conversation session {payload.session_id} not found"})
-    if session["status"] != "completed" or "fluency_score" not in session:
-        return JSONResponse(status_code=422, content={
-            "error": "That session hasn't completed scoring yet — end the conversation first, then re-baseline from it.",
-        })
-
-    metric_scores = {
-        "fluency": session["fluency_score"],
-        "vocabulary": session["vocabulary_score"],
-        "pronunciation": session["pronunciation_score"],
-    }
-    target_accent_id = await _current_target_accent_id(user_id)
-    result = await _staleness_service.execute_rebaseline(
-        user_id, metric_scores, target_accent_id=target_accent_id, audio_clip_id=payload.session_id,
-    )
-    return {
-        "assessment_id": result.assessment_id,
-        "timestamp": result.timestamp.isoformat(),
-        "overall_score": result.overall_score,
-        "metrics": {k: v.score for k, v in result.metrics.items()},
-        "assessment_type": result.assessment_type,
-        "notice": result.notice,
-    }
-
-
-async def record_conversation_drill(user_id: str, session_id: str, metric_scores: Dict[str, float]) -> None:
-    """
-    Called (best-effort, from conversation_service._end_session) every time
-    a conversation ends with real scores. Appends to AccentProfile.drills_history
-    so US-83 disputes have something real to reference; on a user's very
-    first conversation, also establishes their initial baseline (via
-    AccentProfilePipelineService.get_profile/save_profile — the same public
-    read/write surface a caller outside this file would use, no changes to
-    profile_pipeline.py itself) so US-84 staleness tracking has a real
-    starting point instead of never triggering for users who never take a
-    dedicated "baseline" action.
-    """
-    now = _now()
-    target_accent_id = await _current_target_accent_id(user_id)
-    metrics = {name: ScoredMetric(metric_name=name, score=score, audio_clip_id=session_id)
-               for name, score in metric_scores.items()}
-    drill = AccentAssessmentResult(
-        assessment_id=session_id,
-        user_id=user_id,
-        timestamp=now,
-        metrics=metrics,
-        overall_score=calculate_overall_accent_score(metrics),
-        target_accent_id=target_accent_id,
-        assessment_type="drill",
-        audio_clip_id=session_id,
-        is_audio_available=False,  # honest: this backend never persists raw audio
-    )
-
-    profile = await _pipeline_service.get_profile(user_id)
-    if profile is None:
-        profile = AccentProfile(
-            user_id=user_id, target_accent_id=target_accent_id,
-            created_at=now, last_assessment_at=now,
-            baselines_history=[drill], drills_history=[],
-        )
-        logger.info("Accent profile initialized for %s from first conversation session %s", user_id, session_id)
+async def get_target_passage(passage_id: Optional[str] = None, difficulty: Optional[str] = None):
+    if passage_id:
+        passage = _passage_bank.get_by_id(passage_id)
+        if not passage:
+            raise PassageNotFoundError(f"Unknown passage_id: {passage_id}")
     else:
-        profile.drills_history.append(drill)
-    await _pipeline_service.save_profile(profile)
+        passage = _passage_bank.random(difficulty)
+    return TargetPassageSchema(**passage)
 
 
-# ── US-83 / ACC-US-04: Score Dispute ────────────────────────────────────────
-async def get_disputes(user_id: str) -> Dict:
-    disputes = await _dispute_service.get_user_disputes(user_id)
-    remaining = await _dispute_service.get_remaining_daily_disputes(user_id)
-    return {
-        "disputes": [_dispute_summary(d) for d in sorted(disputes, key=lambda d: d.created_at, reverse=True)],
-        "remaining_allowance": remaining,
-        "max_daily_allowance": _dispute_service.max_disputes_per_day,
-    }
+# ── Dimension scoring ────────────────────────────────────────────────────────────────
+def _pronunciation_score(aligned_words: List[AlignedWord], transcript_words) -> float:
+    matched = [a for a in aligned_words if a.transcript_word is not None]
+    if not matched:
+        return 0.0
+    confidences = [transcript_words[a.transcript_index].probability for a in matched]
+    return round(100.0 * (sum(confidences) / len(confidences)), 2)
 
 
-def _dispute_summary(d) -> Dict:
-    return {
-        "dispute_id": d.dispute_id,
-        "assessment_id": d.assessment_id,
-        "metric_name": d.metric_name,
-        "original_score": d.original_score,
-        "reason": d.reason,
-        "user_comment": d.user_comment,
-        "status": d.status,
-        "audio_available": d.audio_available,
-        "created_at": d.created_at.isoformat(),
-        "revised_score": d.revised_score,
-        "auto_flagged_for_content_team": d.auto_flagged_for_content_team,
-        "notification": d.notification,
-    }
+def _stress_score(aligned_words: List[AlignedWord], config: SpeechConfig, prosody, transcript_words) -> float:
+    checkable = 0
+    within_tolerance = 0
+    for a in aligned_words:
+        if a.transcript_word is None:
+            continue
+        expected = text_alignment.expected_stress_position(a.target_word)
+        if expected is None:
+            continue
+        timing = transcript_words[a.transcript_index]
+        peak_pos = prosody_engine.word_stress_peak_position(prosody, timing.start, timing.end)
+        if peak_pos is None:
+            continue
+        checkable += 1
+        if abs(peak_pos - expected) <= config.stress_error_sensitivity:
+            within_tolerance += 1
+    if checkable == 0:
+        # No multisyllabic in-dictionary words could be checked -- neutral score,
+        # not a penalty for something we couldn't measure.
+        return 100.0
+    return round(100.0 * (within_tolerance / checkable), 2)
 
 
-async def submit_dispute(user_id: str, payload: SubmitDisputeSchema) -> Dict:
-    profile = await _pipeline_service.get_profile(user_id)
-    assessment = _find_assessment(profile, payload.assessment_id) if profile else None
-    if assessment is None:
-        return JSONResponse(status_code=404, content={
-            "error": f"No scored assessment '{payload.assessment_id}' found for this user.",
-        })
+def _rhythm_score(prosody, config: SpeechConfig) -> float:
+    """rhythm_max_acceptable_cv=2.0 (not something smaller/more "intuitive" like 0.5) is
+    an empirical default, not a guess: natural fluent English speech has real, expected
+    variation in inter-syllable timing from phrase-boundary pauses and vowel reduction
+    on unstressed syllables -- checked against five real recorded samples during review,
+    coefficient of variation landed between 0.5 and 0.9 on all of them. A 0.5 ceiling
+    would floor the rhythm score near zero for essentially any real speech; 2.0 leaves
+    normal fluent delivery in a reasonable 55-75 range and still penalizes genuinely
+    erratic timing well above that.
+    """
+    cv = prosody_engine.rhythm_coefficient_of_variation(prosody.syllable_nuclei_times)
+    if cv is None:
+        return 70.0  # not enough syllable nuclei to measure reliably -- moderate default
+    score = 100.0 * (1.0 - min(cv, config.rhythm_max_acceptable_cv) / config.rhythm_max_acceptable_cv)
+    return round(max(0.0, min(100.0, score)), 2)
 
-    result = await _dispute_service.submit_dispute(
-        user_id, assessment, payload.metric_name, payload.reason, user_comment=payload.user_comment,
+
+def _intonation_score(prosody, config: SpeechConfig) -> float:
+    lo, hi = config.intonation_ideal_range_min_semitones, config.intonation_ideal_range_max_semitones
+    pitch_range = prosody.pitch_range_semitones
+    if lo <= pitch_range <= hi:
+        return 100.0
+    if pitch_range < lo:
+        return round(max(0.0, 100.0 * (pitch_range / lo)), 2) if lo > 0 else 0.0
+    excess = pitch_range - hi
+    return round(max(0.0, 100.0 - (excess / hi) * 100.0), 2) if hi > 0 else 0.0
+
+
+def _clarity_score(aligned_words: List[AlignedWord], config: SpeechConfig) -> float:
+    total = len(aligned_words)
+    if total == 0:
+        return 0.0
+    misses = 0.0
+    for a in aligned_words:
+        if a.transcript_word is not None:
+            continue
+        syllables = text_alignment.syllable_count(a.target_word) or 1
+        if syllables >= config.multisyllabic_min_syllables:
+            misses += config.clarity_skipped_multisyllabic_penalty_weight
+        else:
+            misses += 1.0
+    return round(max(0.0, 100.0 * (1.0 - misses / total)), 2)
+
+
+def _weak_points(
+    aligned_words: List[AlignedWord],
+    transcript_words,
+    prosody,
+    config: SpeechConfig,
+    rhythm_score: float,
+    intonation_score: float,
+) -> List[WeakPointSchema]:
+    points: List[WeakPointSchema] = []
+
+    th_mispronounced = [
+        a.target_word
+        for a in aligned_words
+        if a.transcript_word is not None
+        and "th" in a.target_word.lower()
+        and recording_engine.classify_word_status(a.target_word, transcript_words[a.transcript_index], prosody, config)
+        == WordStatus.MISPRONOUNCED
+    ]
+    if len(th_mispronounced) >= 2:
+        points.append(WeakPointSchema(issue="th sound", detail=f"Mispronounced: {', '.join(th_mispronounced[:5])}"))
+
+    stress_error_words = [
+        a.target_word
+        for a in aligned_words
+        if a.transcript_word is not None
+        and recording_engine.classify_word_status(a.target_word, transcript_words[a.transcript_index], prosody, config)
+        == WordStatus.STRESS_ERROR
+    ]
+    if len(stress_error_words) >= 2:
+        points.append(
+            WeakPointSchema(issue="word-final stress", detail=f"Stress placement was off on: {', '.join(stress_error_words[:5])}")
+        )
+
+    skipped_multisyllabic = [
+        a.target_word
+        for a in aligned_words
+        if a.transcript_word is None and (text_alignment.syllable_count(a.target_word) or 1) >= config.multisyllabic_min_syllables
+    ]
+    if skipped_multisyllabic:
+        points.append(
+            WeakPointSchema(issue="multisyllabic word clarity", detail=f"Skipped or unclear: {', '.join(skipped_multisyllabic[:5])}")
+        )
+
+    if rhythm_score < 60.0:
+        points.append(WeakPointSchema(issue="speech rhythm", detail="Syllable timing was noticeably irregular across the passage"))
+
+    if intonation_score < 60.0:
+        direction = "flat/monotone" if prosody.pitch_range_semitones < config.intonation_ideal_range_min_semitones else "erratic"
+        points.append(WeakPointSchema(issue="intonation range", detail=f"Pitch variation was {direction} across the passage"))
+
+    return points
+
+
+async def submit_passage_assessment(
+    passage_id: str,
+    audio: UploadFile = File(...),
+    user_id: str = Depends(require_auth),
+):
+    passage = _passage_bank.get_by_id(passage_id)
+    if not passage:
+        raise PassageNotFoundError(f"Unknown passage_id: {passage_id}")
+
+    config = load_speech_config()
+    await ensure_voice_consent(user_id)
+    audio_bytes = await audio.read()
+    max_bytes = config.accent_max_upload_mb * 1024 * 1024
+    if len(audio_bytes) > max_bytes:
+        raise UploadTooLargeError(f"Recording exceeds the {config.accent_max_upload_mb}MB limit")
+
+    try:
+        analysis = recording_engine.analyze_recording(audio_bytes, config)
+    except AudioDecodeError as e:
+        raise UnreadableAudioError(str(e))
+
+    aligned_words, coverage = recording_engine.align_to_passage(analysis, passage["text"], config)
+
+    rejection = analysis.rejection
+    if rejection is None and analysis.multiple_voices_detected:
+        rejection = RejectionReason.MULTIPLE_VOICES_DETECTED
+    if rejection is None and (
+        coverage.coverage_ratio < config.passage_min_coverage
+        or coverage.trailing_coverage_ratio < config.passage_min_coverage
+    ):
+        rejection = RejectionReason.INCOMPLETE_RECORDING
+
+    if rejection is not None:
+        await db.accentassessment.create(
+            data={
+                "userId": user_id,
+                "passageId": passage_id,
+                "status": _REJECTION_TO_STATUS[rejection],
+                "rejectionReason": rejection.value,
+                "transcript": analysis.transcript or None,
+            }
+        )
+        return JSONResponse(
+            status_code=422,
+            content=RecordingRejectedSchema(reason=rejection.value, message=_REJECTION_MESSAGES[rejection]).model_dump(),
+        )
+
+    pronunciation_score = _pronunciation_score(aligned_words, analysis.words)
+    stress_score = _stress_score(aligned_words, config, analysis.prosody, analysis.words)
+    rhythm_score = _rhythm_score(analysis.prosody, config)
+    intonation_score = _intonation_score(analysis.prosody, config)
+    clarity_score = _clarity_score(aligned_words, config)
+    weak_points = _weak_points(aligned_words, analysis.words, analysis.prosody, config, rhythm_score, intonation_score)
+
+    assessment = await db.accentassessment.create(
+        data={
+            "userId": user_id,
+            "passageId": passage_id,
+            "status": AccentAssessmentStatus.COMPLETED,
+            "transcript": analysis.transcript,
+            "pronunciationScore": pronunciation_score,
+            "stressScore": stress_score,
+            "rhythmScore": rhythm_score,
+            "intonationScore": intonation_score,
+            "clarityScore": clarity_score,
+            "weakPoints": Json([w.model_dump() for w in weak_points]),
+            "completedAt": datetime.now(timezone.utc),
+        }
     )
-    if not result.success:
-        status = 429 if "limit reached" in (result.error_message or "") else 422
-        return JSONResponse(status_code=status, content={
-            "error": result.error_message,
-            "remaining_allowance": result.remaining_allowance,
-            "max_daily_allowance": result.max_daily_allowance,
-            "offer_reassessment": result.offer_reassessment,
-        })
-    return {
-        "success": True,
-        "dispute": _dispute_summary(result.dispute),
-        "remaining_allowance": result.remaining_allowance,
-        "max_daily_allowance": result.max_daily_allowance,
-        "auto_flagged_for_content_team": result.auto_flagged_for_content_team,
-        "notice": result.notice,
-    }
 
+    # Local import breaks the accent_assessment/accent_profile import cycle -- profile
+    # generation is US-89's job, triggered here the same way assessment_service.py
+    # triggers reassessment_service's regression check after a completed baseline.
+    from services import accent_profile_service
 
-# ═══════════════════════════════════════════════════════════════════════════
-# FastAPI controllers
-# ═══════════════════════════════════════════════════════════════════════════
-async def target_accents_endpoint(user_id: str = Depends(require_auth)):
-    return await list_target_accents(user_id)
+    await accent_profile_service.generate_profile_from_assessment(assessment)
 
-
-async def get_target_accent_endpoint(user_id: str = Depends(require_auth)):
-    return await get_target_accent(user_id)
-
-
-async def select_target_accent_endpoint(payload: SelectTargetAccentSchema, user_id: str = Depends(require_auth)):
-    return await select_target_accent(user_id, payload)
-
-
-async def get_profile_endpoint(user_id: str = Depends(require_auth)):
-    return await get_profile(user_id)
-
-
-async def check_staleness_endpoint(user_id: str = Depends(require_auth)):
-    return await check_staleness(user_id)
-
-
-async def dismiss_staleness_endpoint(user_id: str = Depends(require_auth)):
-    return await dismiss_staleness_prompt(user_id)
-
-
-async def rebaseline_endpoint(payload: RebaselineSchema, user_id: str = Depends(require_auth)):
-    return await rebaseline(user_id, payload)
-
-
-async def get_disputes_endpoint(user_id: str = Depends(require_auth)):
-    return await get_disputes(user_id)
-
-
-async def submit_dispute_endpoint(payload: SubmitDisputeSchema, user_id: str = Depends(require_auth)):
-    return await submit_dispute(user_id, payload)
+    return AccentAssessmentResultSchema(
+        assessment_id=assessment.id,
+        passage_id=passage_id,
+        status="completed",
+        transcript=analysis.transcript,
+        pronunciation_score=pronunciation_score,
+        stress_score=stress_score,
+        rhythm_score=rhythm_score,
+        intonation_score=intonation_score,
+        clarity_score=clarity_score,
+        weak_points=weak_points,
+    )

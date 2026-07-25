@@ -1,6 +1,5 @@
 from fastapi import APIRouter
-
-from services.accent_assessment_service import (
+from services.target_accent_management_service import (
     check_staleness_endpoint,
     dismiss_staleness_endpoint,
     get_disputes_endpoint,

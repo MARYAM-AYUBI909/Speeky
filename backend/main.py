@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()  # must run before any os.environ reads below
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -14,6 +14,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
+from routers.voice_consent_routes import router as voice_consent_router
 
 from lib.prisma_client import db
 from middlewares.error_handler import (
@@ -23,17 +24,21 @@ from middlewares.error_handler import (
     unhandled_exception_handler,
     validation_error_handler,
 )
+from routers.accent_progress_routes import router as accent_progress_router
 from routers.auth_routes import router as auth_router
 from routers.user_routes import router as user_router
 from routers.assessment_routes import router as assessment_router
 from routers.coaching_routes import router as coaching_router
 from routers.conversation_routes import router as conversation_router
 from routers.interview_coach_routes import router as interview_coach_router
+from routers.pronunciation_routes import router as pronunciation_router
+from routers.accent_routes import router as accent_router
+from routers.practice_time_routes import router as practice_time_router
+from routers.progress_dashboard_routes import router as progress_dashboard_router
+from routers.accent_progress_routes import router as accent_progress_router
 from routers.resume_jd_routes import router as resume_jd_router
+from routers.scenario_routes import router as scenario_router
 from routers.session_memory_routes import router as session_memory_router
-from routers.code_switch_routes import router as code_switch_router
-from routers.pronunciation_coach_routes import router as pronunciation_coach_router
-from routers.accent_assessment_routes import router as accent_assessment_router
 from utils.app_error import AppError
 
 
@@ -75,7 +80,7 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 async def health():
     return HTMLResponse("<h1>Speeky API is running!</h1>")
 
-
+app.include_router(voice_consent_router, prefix="/api/voice-consent")
 app.include_router(auth_router, prefix="/api/auth")
 app.include_router(user_router, prefix="/api/users")
 app.include_router(assessment_router, prefix="/api/assessment")
@@ -84,9 +89,6 @@ app.include_router(conversation_router, prefix="/api/conversation")
 app.include_router(interview_coach_router, prefix="/api/interview-coach")
 app.include_router(session_memory_router, prefix="/api/session-memory")
 app.include_router(resume_jd_router, prefix="/api/resume-jd-intake")
-app.include_router(code_switch_router, prefix="/api/code-switch")
-app.include_router(pronunciation_coach_router, prefix="/api/pronunciation-coach")
-app.include_router(accent_assessment_router, prefix="/api/accent-assessment")
 
 # Local-folder avatar storage, exposed to frontend as static files
 _uploads_dir = os.path.join(os.path.dirname(__file__), "uploads")
@@ -94,9 +96,11 @@ os.makedirs(os.path.join(_uploads_dir, "avatars"), exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=_uploads_dir), name="uploads")
 
 
-# Port of app.js's `app.all("/{*path}", ...)` catch-all 404 — must stay the LAST
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def not_found(full_path: str, request: Request):
+    if request.url.path == "/favicon.ico":
+        return Response(status_code=204)
+    
     raise AppError(f"Route not found: {request.url.path}", 404)
 
 

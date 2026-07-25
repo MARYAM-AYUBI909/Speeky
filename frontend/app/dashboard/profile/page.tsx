@@ -6,6 +6,7 @@ import { LearningGoalSection } from "@/components/dashboard/profile/LearningGoal
 import { AssessmentSection } from "@/components/dashboard/profile/AssessmentSection";
 import { PerformanceMemorySection } from "@/components/dashboard/profile/PerformanceMemorySection";
 import { PrivacyConsentSection } from "@/components/dashboard/profile/PrivacyConsentSection";
+import { NotificationPreferencesSection } from "@/components/dashboard/profile/NotificationPreferencesSection";
 import { ConversationMemorySection } from "@/components/dashboard/profile/ConversationMemorySection";
 import { CodeSwitchSection } from "@/components/dashboard/profile/CodeSwitchSection";
 import { CodeSwitchWordListSection } from "@/components/dashboard/profile/CodeSwitchWordListSection";
@@ -30,6 +31,7 @@ export default function ProfilePage() {
       <AssessmentSection />
       <PerformanceMemorySection />
       <PrivacyConsentSection />
+      <NotificationPreferencesSection />
       <ConversationMemorySection />
       <TargetAccentSection />
       <AccessibilityProfileSection />

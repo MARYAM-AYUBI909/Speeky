@@ -244,7 +244,22 @@ async def start_assessment(user_id: str = Depends(require_auth)):
 async def _begin_assessment(user_id: str):
     existing = await db.baselineassessment.find_first(where={"userId": user_id, "completedAt": None})
     if existing:
-        return JSONResponse(status_code=400, content={"error": "Assessment already in progress."})
+        # Resume, don't dead-end. A browser back / refresh / accidental navigation loses
+        # the client-side assessment_id; the old 400 then trapped the user (can't start a
+        # second, can't resume the first). Return the current question so "Start" resumes
+        # exactly where they left off. currentIndex is always < len for a non-completed row
+        # (reaching len triggers completion), but clamp defensively.
+        idx = min(existing.currentIndex, len(existing.questionIds) - 1)
+        resume_q = _question_bank.get_by_id(existing.questionIds[idx])
+        return {
+            "assessment_id": existing.id,
+            "total_questions": len(existing.questionIds),
+            "current_question": resume_q.text if resume_q else "",
+            "question_index": idx,
+            "question_mode": _question_bank.get_question_mode(resume_q) if resume_q else "text",
+            "estimated_duration_minutes": len(existing.questionIds),
+            "resumed": True,
+        }
 
     questions = _question_bank.get_assessment_questions(text_count=3, audio_count=7)
 
@@ -467,6 +482,28 @@ async def _complete_assessment(assessment: BaselineAssessment) -> Dict:
         "flag_reason": flag_reason,
         "regression": regression,
     }
+
+
+async def get_voice_token(assessment_id: str, user_id: str = Depends(require_auth)):
+    """Mint a LiveKit room token for a spoken assessment answer — same voice pipeline as
+    AI Conversation (lib/livekit_tokens + the generic voice_agent/ worker). The room name
+    IS the assessment_id; the worker auto-joins, runs Silero VAD + faster-whisper on the
+    mic track, and publishes the transcript back over the data channel. Backend never
+    touches raw audio. Replaces the browser Web Speech API path, which needed a secure
+    context (HTTPS/localhost) and was Chromium-only — the cause of the baseline audio error."""
+    from lib import livekit_tokens
+
+    assessment = await db.baselineassessment.find_unique(where={"id": assessment_id})
+    if not assessment or assessment.userId != user_id:
+        return JSONResponse(status_code=404, content={"error": "Assessment not found"})
+    if assessment.completedAt:
+        return JSONResponse(status_code=400, content={"error": "Assessment already completed"})
+    if not livekit_tokens.is_configured():
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Voice mode unavailable. Use text mode instead."},
+        )
+    return livekit_tokens.mint_room_token(assessment_id, identity=user_id)
 
 
 async def get_assessment_status(assessment_id: str, user_id: str = Depends(require_auth)):

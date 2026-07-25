@@ -11,11 +11,8 @@ import {
   Users,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-<<<<<<< HEAD
 import { AccentStalenessBanner } from "@/components/dashboard/AccentStalenessBanner";
-=======
 import { DailyChallengeCard } from "@/components/dashboard/DailyChallengeCard";
->>>>>>> origin/main
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/contexts/AuthContext";
 import {
@@ -84,9 +81,9 @@ export default function DashboardPage() {
         </Button>
       </div>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_2fr]">
-        <DailyChallengeCard />
+      <DailyChallengeCard />
 
+      <div className="grid grid-cols-1 gap-6">
         <div
           className="animate-fade-up rounded-2xl border border-border bg-surface-elevated p-6 shadow-sm transition-shadow duration-200 hover:shadow-md"
           style={{ animationDelay: "150ms" }}

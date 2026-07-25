@@ -108,6 +108,7 @@ model User {
   subDialectPreference   String?
   livenessFlagCount      Int                      @default(0)
   isAccentSuspended      Boolean                  @default(false)
+  codeSwitchWords        CodeSwitchWord[]
 
   // PDG-US-15: lifetime cumulative practice time (seconds) credited via
   // practice_time_service pings, and the milestone-hour thresholds already
@@ -115,7 +116,35 @@ model User {
   lifetimePracticeSeconds Float @default(0)
   unlockedMilestoneHours  Int[] @default([])
 
+  // PDG-US-11: Daily Challenge streak. lastChallengeDate is the LOCAL calendar date
+  // (YYYY-MM-DD, from the session's start time) of the last qualifying completion — stored
+  // as a string so day-boundary math is timezone-honest without a stored offset. streakBadges
+  // holds the day-milestones already awarded (7, 30) so a repeat crossing doesn't re-award.
+  currentStreak     Int      @default(0)
+  longestStreak     Int      @default(0)
+  lastChallengeDate String?
+  streakBadges      Int[]    @default([])
+
   @@map("users")
+}
+
+// CSC-US-01: personalized "common code-switch words" list. One row per (userId, word) —
+// a repeat use UPDATES the row (count++ / lastSeenAt), never appends a duplicate, so the
+// practice tracker shows each trouble-word once with its frequency. Populated from the
+// code_switch flags Workplace Coaching already produces (services/code_switch_tracker.py).
+model CodeSwitchWord {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  word        String // the code-switched (non-English) word, lowercased
+  suggestion  String // English equivalent surfaced to the learner
+  count       Int      @default(1) // times the learner has used this word
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+
+  @@unique([userId, word])
+  @@index([userId, lastSeenAt])
+  @@map("code_switch_words")
 }
 
 // Scenario-Based Learning session --> String (not an enum, unlike CoachingScenario) because admins can add custom

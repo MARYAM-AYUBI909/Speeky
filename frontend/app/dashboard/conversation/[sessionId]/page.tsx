@@ -21,7 +21,6 @@ import {
   type ConversationTurn,
   type EndConversationResult,
 } from "@/lib/conversation";
-<<<<<<< HEAD
 import { scoreConversationTurn, type SentenceScoreResult } from "@/lib/pronunciationCoach";
 import { ScoreDisputeButton } from "@/components/dashboard/ScoreDisputeButton";
 
@@ -94,11 +93,9 @@ function PronunciationBreakdown({ sessionId, turnIndex }: { sessionId: string; t
     </div>
   );
 }
-=======
 import { playText } from "@/lib/tts";
 import { useAutoScroll } from "@/lib/useAutoScroll";
 import { useLiveKitVoice } from "@/lib/useLiveKitVoice";
->>>>>>> origin/main
 
 export default function ConversationSessionPage() {
   const params = useParams<{ sessionId: string }>();

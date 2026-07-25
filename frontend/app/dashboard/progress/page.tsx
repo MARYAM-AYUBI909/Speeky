@@ -5,6 +5,7 @@ import { Lock, TrendingUp, X } from "lucide-react";
 import { AccentProgressTracker } from "@/components/dashboard/progress/AccentProgressTracker";
 import { PracticeTimeMilestones } from "@/components/dashboard/progress/PracticeTimeMilestones";
 import { VocabularyGrowthTracker } from "@/components/dashboard/progress/VocabularyGrowthTracker";
+import { ProgressDashboardOverview } from "@/components/dashboard/progress/ProgressDashboardOverview";
 import { useAssessmentAccess } from "@/contexts/AssessmentContext";
 import { ApiError } from "@/lib/api";
 import { dismissTroubleWord, getActiveTroubleWords, type TroubleWordEntry } from "@/lib/pronunciationCoach";
@@ -116,10 +117,10 @@ export default function ProgressPage() {
     <div className="flex flex-col gap-8">
       <div>
         <h1 className="font-serif text-3xl font-semibold tracking-tight text-foreground">
-          Progress
+          Progress Dashboard
         </h1>
         <p className="mt-2 max-w-xl text-sm text-muted-foreground">
-          Track your vocabulary growth and accent improvement over time.
+          Track your overall confidence score, vocabulary growth, practice time, and accent improvement over time.
         </p>
       </div>
 
@@ -131,6 +132,7 @@ export default function ProgressPage() {
         </div>
       ) : (
         <div className="flex flex-col gap-6">
+          <ProgressDashboardOverview />
           <VocabularyGrowthTracker />
           <PracticeTimeMilestones />
           <AccentProgressTracker />

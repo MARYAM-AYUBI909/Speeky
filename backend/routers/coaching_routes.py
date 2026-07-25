@@ -9,6 +9,8 @@ from services.coaching_service import (
     voice_token,
 )
 
+from services.filler_word_service import get_filler_words_for_session
+
 router = APIRouter()
 
 # Workplace English Coaching
@@ -17,4 +19,7 @@ router.add_api_route("/start", start_session, methods=["POST"])
 router.add_api_route("/{session_id}/turn", roleplay_turn, methods=["POST"])
 router.add_api_route("/{session_id}/voice-token", voice_token, methods=["POST"])
 router.add_api_route("/{session_id}/submit", submit_session, methods=["POST"])
+router.add_api_route("/{session_id}/filler-words", get_filler_words_for_session, methods=["GET"])
+router.add_api_route("/sessions/{session_id}/filler-words", get_filler_words_for_session, methods=["GET"])
 router.add_api_route("/{session_id}", get_session, methods=["GET"])
+

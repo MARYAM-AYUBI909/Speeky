@@ -48,6 +48,8 @@ async def api_submit_qa_response(
     return await submit_qa_response(session_id, user_id, response)
 
 
+from services.filler_word_service import get_filler_words_for_session
+
 @router.get("/{session_id}")
 async def api_get_session(
     session_id: str,
@@ -55,3 +57,13 @@ async def api_get_session(
 ):
     """Get session details"""
     return await get_session(session_id, user_id)
+
+
+@router.get("/{session_id}/filler-words")
+async def api_get_filler_words(
+    session_id: str,
+    user_id: str = Depends(require_auth),
+):
+    """Get filler word breakdown and timeline markers for session (PSC-US-08)"""
+    return await get_filler_words_for_session(session_id, user_id)
+

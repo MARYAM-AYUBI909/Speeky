@@ -15,6 +15,8 @@ import { AccessibilityProfileSection } from "@/components/dashboard/profile/Acce
 import { SecuritySection } from "@/components/dashboard/profile/SecuritySection";
 import { DangerZoneSection } from "@/components/dashboard/profile/DangerZoneSection";
 
+import { LocalAccentCalibrationSection } from "@/components/dashboard/profile/LocalAccentCalibrationSection";
+
 export default function ProfilePage() {
   const { user } = useAuth();
 
@@ -29,6 +31,7 @@ export default function ProfilePage() {
       <ProfileInfoSection />
       <LearningGoalSection />
       <AssessmentSection />
+      <LocalAccentCalibrationSection />
       <PerformanceMemorySection />
       <PrivacyConsentSection />
       <NotificationPreferencesSection />

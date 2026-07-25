@@ -336,7 +336,7 @@ export default function PronunciationCoachPage() {
                   key={`${w.word}-${i}`}
                   className={cn(
                     "rounded-full px-3 py-1 text-sm font-medium",
-                    w.correct ? "bg-success/15 text-success" : "bg-danger/15 text-danger",
+                    w.status === "correct" ? "bg-success/15 text-success" : "bg-danger/15 text-danger",
                   )}
                 >
                   {w.word}

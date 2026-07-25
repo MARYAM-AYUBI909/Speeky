@@ -80,6 +80,12 @@ export function submitPublicSpeakingTurn(
     audio_data?: string | null;
     text_content: string | null;
     duration_seconds?: number | null;
+    audio_features?: {
+      word_timings?: { word: string; start: number; end: number }[];
+      avg_db?: number;
+      pitch_range_semitones?: number;
+      duration_seconds?: number;
+    };
     is_final: boolean;
   }
 ): Promise<SubmitTurnResult> {

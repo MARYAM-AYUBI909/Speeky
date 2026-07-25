@@ -22,7 +22,7 @@ import {
   getPublicSpeakingVoiceToken,
   type SpeechType,
 } from "@/lib/publicSpeaking";
-import { useLiveKitVoice } from "@/lib/useLiveKitVoice";
+import { useLiveKitVoice, type VoiceFeatures } from "@/lib/useLiveKitVoice";
 
 const SPEECH_TYPE_CONFIG: Record<string, { label: string; description: string; ideal_wpm: string }> = {
   business_pitch: {
@@ -75,6 +75,16 @@ export default function PublicSpeakingSessionPage() {
   sessionIdRef.current = sessionId;
   const voiceStartedAt = React.useRef<number | null>(null);
   const voiceDurationRef = React.useRef<number>(0);
+  // Full-mode acoustic features accumulated across VAD utterances (word timings appended,
+  // speech duration summed, prosody/level kept). Sent with the turn so the backend scores
+  // real tone/clarity instead of proxies.
+  const featuresRef = React.useRef({
+    has: false,
+    word_timings: [] as { word: string; start: number; end: number }[],
+    duration_seconds: 0,
+    avg_db: undefined as number | undefined,
+    pitch_range_semitones: 0,
+  });
   const fetchVoiceToken = React.useCallback(() => {
     const id = sessionIdRef.current;
     if (!id) return Promise.reject(new Error("No active session"));
@@ -88,8 +98,17 @@ export default function PublicSpeakingSessionPage() {
     error: voiceError,
     startVoice,
     stopVoice,
-  } = useLiveKitVoice(fetchVoiceToken, (text) => {
+  } = useLiveKitVoice(fetchVoiceToken, (text, features?: VoiceFeatures) => {
     setTextContent((prev) => (prev.trim() ? `${prev.trim()} ${text}` : text));
+    if (features) {
+      const acc = featuresRef.current;
+      if (features.word_timings) acc.word_timings.push(...features.word_timings);
+      if (typeof features.duration_seconds === "number") acc.duration_seconds += features.duration_seconds;
+      if (typeof features.avg_db === "number") acc.avg_db = features.avg_db;
+      if (typeof features.pitch_range_semitones === "number")
+        acc.pitch_range_semitones = Math.max(acc.pitch_range_semitones, features.pitch_range_semitones);
+      acc.has = true;
+    }
   });
 
   const handleStartVoice = async () => {
@@ -137,10 +156,21 @@ export default function PublicSpeakingSessionPage() {
     setIsSubmitting(true);
     setError(null);
     try {
+      const f = featuresRef.current;
       const data = await submitPublicSpeakingTurn(sessionId, {
         text_content: content,
         duration_seconds:
-          inputMode === "audio" ? Math.max(1, voiceDurationRef.current) : null,
+          inputMode === "audio"
+            ? Math.max(1, f.duration_seconds || voiceDurationRef.current)
+            : null,
+        audio_features: f.has
+          ? {
+              word_timings: f.word_timings,
+              avg_db: f.avg_db,
+              pitch_range_semitones: f.pitch_range_semitones,
+              duration_seconds: f.duration_seconds,
+            }
+          : undefined,
         is_final: true,
       });
       setScorecard(data.scorecard);

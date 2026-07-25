@@ -95,6 +95,28 @@ MIC_QUIET_DB = -45.0
 CLIPPING_DB = -3.0
 
 
+class _AgentProsody:
+    """Minimal stand-in for prosody_engine.ProsodyData carrying only the field the
+    scorecard reads (pitch range), populated from the LiveKit full-mode features."""
+
+    def __init__(self, pitch_range_semitones: float):
+        self.pitch_range_semitones = pitch_range_semitones
+
+
+class _AgentAnalysis:
+    """Adapter that lets the scorecard treat LiveKit full-mode features like a
+    recording_engine.RecordingAnalysis (same attributes it reads: prosody / avg_dbfs /
+    snr_db / rejection). The voice_agent trims silence before it ever sees the audio, so a
+    true noise-floor SNR isn't available — clarity therefore assumes a clean channel unless
+    the agent later sends snr_db."""
+
+    def __init__(self, features: Dict):
+        self.prosody = _AgentProsody(float(features.get("pitch_range_semitones", 0.0)))
+        self.avg_dbfs = float(features.get("avg_db", -20.0))
+        self.snr_db = float(features.get("snr_db", 20.0))
+        self.rejection = None
+
+
 async def start_session(
     user_id: str,
     request: StartPublicSpeakingSchema,
@@ -146,13 +168,21 @@ async def submit_turn(
         # Legacy base64-upload pipeline (full prosody/SNR delivery metrics).
         transcript, audio_features, analysis = await _process_audio(turn.audio_data)
         text_content = transcript
-    elif turn.duration_seconds is not None:
-        # Shared LiveKit voice pipeline: the voice_agent already transcribed; only the
-        # transcript + spoken duration reach us (raw audio stays in the room). Real WPM,
-        # proxy tone/clarity — matches Conversation / Baseline.
+    elif turn.audio_features or turn.duration_seconds is not None:
+        # Shared LiveKit voice pipeline. In FULL mode the voice_agent also sends acoustic
+        # features (word timings + prosody + level), so we recover real WPM/tone/clarity —
+        # matching the base64 recording_engine path. In transcript mode only duration
+        # arrives, so tone/clarity fall back to proxies (like Conversation / Baseline).
         text_content = turn.text_content or ""
-        audio_features = AudioFeatures(transcript=text_content, duration_seconds=turn.duration_seconds)
-        analysis = None
+        feats = turn.audio_features or {}
+        dur = turn.duration_seconds if turn.duration_seconds is not None else feats.get("duration_seconds", 0.0)
+        audio_features = AudioFeatures(
+            transcript=text_content,
+            duration_seconds=dur or 0.0,
+            word_timings=feats.get("word_timings", []),
+            avg_db=feats.get("avg_db"),
+        )
+        analysis = _AgentAnalysis(feats) if feats.get("pitch_range_semitones") is not None else None
     else:
         # Typed text
         text_content = turn.text_content or ""
@@ -280,7 +310,8 @@ async def get_voice_token(session_id: str, user_id: str) -> Dict:
             status_code=503,
             content={"error": "Voice mode unavailable. Use text mode instead."},
         )
-    return livekit_tokens.mint_room_token(session_id, identity=user_id)
+    # Public Speaking needs delivery metrics -> full mode (word timings + prosody + level).
+    return livekit_tokens.mint_room_token(session_id, identity=user_id, mode="full")
 
 
 async def get_session(session_id: str, user_id: str) -> Dict:
@@ -856,7 +887,7 @@ def _is_nonsense_content(text: str) -> bool:
         return True
     
     # Check for repetitive patterns
-    unique_words = set(words.lower())
+    unique_words = set(word.lower() for word in words)
     if len(unique_words) < 5:
         return True
     

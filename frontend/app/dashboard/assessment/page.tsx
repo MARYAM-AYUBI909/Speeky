@@ -14,13 +14,14 @@ import { ApiError } from "@/lib/api";
 import {
   attemptSkipAssessment,
   confirmSkipAssessment,
+  getAssessmentVoiceToken,
   getResultsSummary,
   startAssessment,
   submitAssessmentResponse,
   type AssessmentSummary,
   type SkipAttemptResult,
 } from "@/lib/assessment";
-import { useSpeechRecognition } from "@/lib/useSpeechRecognition";
+import { useLiveKitVoice } from "@/lib/useLiveKitVoice";
 import { useAssessmentAccess } from "@/contexts/AssessmentContext";
 
 type Step =
@@ -64,16 +65,37 @@ export default function AssessmentPage() {
       setStep({ name: "intro" });
     }
   }, [accessLoading, access]);
-  const [voiceStatus, setVoiceStatus] = React.useState("");
   const voiceStartedAt = React.useRef<number | null>(null);
   const voiceAnswerUsed = React.useRef(false);
+
+  // LiveKit voice mode — same proven pipeline as AI Conversation (server-side Silero VAD
+  // + faster-whisper in voice_agent/), replacing the browser Web Speech API which needed
+  // a secure context and was Chromium-only. The token's room name is the assessment_id,
+  // so fetchVoiceToken must read the *current* one — hence the ref, since assessmentId
+  // lives in step state and this hook is at the top level.
+  const assessmentIdRef = React.useRef<string | null>(null);
+  const fetchVoiceToken = React.useCallback(() => {
+    const id = assessmentIdRef.current;
+    if (!id) return Promise.reject(new Error("No active assessment"));
+    return getAssessmentVoiceToken(id);
+  }, []);
   const {
-    isSupported: isSpeechSupported,
-    isListening,
-    error: speechError,
-    start,
-    stop,
-  } = useSpeechRecognition();
+    isVoiceActive,
+    isConnectingVoice,
+    isStoppingVoice,
+    voiceStatus,
+    error: voiceError,
+    startVoice,
+    stopVoice,
+  } = useLiveKitVoice(fetchVoiceToken, (text) => {
+    // Accumulate every VAD utterance until the user hits Stop, instead of overwriting
+    // with the latest sentence. The voice_agent/ worker publishes one final transcript
+    // per END_OF_SPEECH, so a natural pause used to drop everything said before it.
+    // Appending (same as AI Conversation) keeps the whole spoken answer and shows it
+    // growing live. Reset happens on Stop/submit/new-question via setAnswer("").
+    setAnswer((prev) => (prev.trim() ? `${prev.trim()} ${text}` : text));
+    voiceAnswerUsed.current = true;
+  });
 
   async function handleStart() {
     setError(null);
@@ -144,7 +166,7 @@ export default function AssessmentPage() {
       setAnswer("");
       voiceStartedAt.current = null;
       voiceAnswerUsed.current = false;
-      setVoiceStatus("");
+      if (isVoiceActive) void stopVoice();
       if (result.status === "completed") {
         const summary = await getResultsSummary(step.assessmentId);
         await refresh();
@@ -164,30 +186,19 @@ export default function AssessmentPage() {
     }
   }
 
-  function handleStartVoice() {
-    if (
-      step.name !== "question" ||
-      step.questionMode !== "audio" ||
-      isListening
-    )
+  async function handleStartVoice() {
+    if (step.name !== "question" || step.questionMode !== "audio" || isVoiceActive) {
       return;
-    voiceStartedAt.current = performance.now();
-    voiceAnswerUsed.current = true;
-    setVoiceStatus("Listening...");
-    const started = start((text) => {
-      setAnswer(text);
-      setVoiceStatus("Transcript captured. Review and continue.");
-    });
-    if (!started) {
-      voiceStartedAt.current = null;
-      voiceAnswerUsed.current = false;
-      setVoiceStatus("Voice input unavailable.");
     }
+    // Wall-clock start for the audio_features.duration_seconds sent on submit (routes the
+    // answer through the backend AUDIO scoring pipeline). Marked used the moment a
+    // transcript lands (see the onTranscript callback above).
+    voiceStartedAt.current = performance.now();
+    await startVoice();
   }
 
   function handleStopVoice() {
-    stop();
-    setVoiceStatus("Voice stopped.");
+    void stopVoice();
   }
 
   if (step.name === "loading") {
@@ -343,6 +354,8 @@ export default function AssessmentPage() {
   }
 
   if (step.name === "question") {
+    // Keep the token-fetch closure pointed at the live assessment (room name == id).
+    assessmentIdRef.current = step.assessmentId;
     const progress = Math.round(
       (step.questionIndex / step.totalQuestions) * 100,
     );
@@ -381,20 +394,23 @@ export default function AssessmentPage() {
               <Button
                 size="sm"
                 variant="outline"
-                disabled={!isSpeechSupported}
-                onClick={isListening ? handleStopVoice : handleStartVoice}
+                loading={isConnectingVoice || isStoppingVoice}
+                disabled={isConnectingVoice || isStoppingVoice}
+                onClick={isVoiceActive ? handleStopVoice : handleStartVoice}
               >
-                {isListening ? "Stop Voice" : "Speak Answer"}
+                {isConnectingVoice
+                  ? "Connecting..."
+                  : isVoiceActive
+                    ? "Stop Voice"
+                    : "Speak Answer"}
               </Button>
               <p className="text-xs text-muted-foreground">
-                {isSpeechSupported
-                  ? "Audio answer sends transcript plus timing."
-                  : "Speech recognition not supported in this browser."}
+                Speak your answer — we transcribe it for you to review before you continue.
               </p>
             </div>
           ) : null}
-          {speechError ? (
-            <p className="mt-2 text-sm text-danger">{speechError}</p>
+          {voiceError ? (
+            <p className="mt-2 text-sm text-danger">{voiceError}</p>
           ) : null}
           {voiceStatus ? (
             <p className="mt-2 text-sm text-muted-foreground">{voiceStatus}</p>

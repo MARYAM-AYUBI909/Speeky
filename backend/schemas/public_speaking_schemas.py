@@ -12,16 +12,25 @@ class StartPublicSpeakingSchema(BaseModel):
 
 
 class PublicSpeakingTurnSchema(BaseModel):
-    """Submit a speech turn (audio or text)"""
-    audio_data: Optional[str] = Field(None, description="Base64 encoded audio file")
-    text_content: Optional[str] = Field(None, description="Text submission")
+    """Submit a speech turn (audio or text).
+
+    Voice now comes through the shared LiveKit voice pipeline (same as Conversation /
+    Baseline): the voice_agent worker transcribes and the client sends the transcript as
+    text_content plus duration_seconds. duration_seconds routes it through the audio
+    scoring path (real WPM; tone/clarity are proxies since raw audio never reaches the
+    backend). audio_data is the legacy base64-upload path, still accepted.
+    """
+    audio_data: Optional[str] = Field(None, description="Base64 encoded audio file (legacy path)")
+    text_content: Optional[str] = Field(None, description="Transcript (voice) or typed text")
+    duration_seconds: Optional[float] = Field(None, description="Spoken duration, when voice")
     is_final: bool = Field(default=False, description="Whether this is the final submission")
 
 
 class QAResponseSchema(BaseModel):
     """Response to AI-generated Q&A question"""
-    audio_data: Optional[str] = Field(None, description="Base64 encoded audio response")
-    text_content: Optional[str] = Field(None, description="Text response")
+    audio_data: Optional[str] = Field(None, description="Base64 encoded audio response (legacy)")
+    text_content: Optional[str] = Field(None, description="Transcript (voice) or typed text")
+    duration_seconds: Optional[float] = Field(None, description="Spoken duration, when voice")
 
 
 class PublicSpeakingScorecard(BaseModel):

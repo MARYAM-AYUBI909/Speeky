@@ -20,6 +20,7 @@ import {
   type ConversationTurn,
   type EndConversationResult,
 } from "@/lib/conversation";
+import { completeDailyChallenge } from "@/lib/dailyChallenge";
 import { playText } from "@/lib/tts";
 import { useAutoScroll } from "@/lib/useAutoScroll";
 import { useLiveKitVoice } from "@/lib/useLiveKitVoice";
@@ -178,6 +179,11 @@ export default function ConversationSessionPage() {
     try {
       const result = await endConversationSession(params.sessionId);
       setSummary(result);
+      // PDG-US-11: a >= 5-min conversation qualifies as the Daily Challenge. Fire-and-forget
+      // so streak bookkeeping never blocks the summary. Credit the session's START day
+      // (now - duration) so a session that ran past midnight counts for the day it began (E-02).
+      const startedAt = new Date(Date.now() - result.duration_seconds * 1000);
+      void completeDailyChallenge(result.duration_seconds, startedAt).catch(() => {});
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong.");
     } finally {

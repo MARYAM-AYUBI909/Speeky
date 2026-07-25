@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Tuple
 from fastapi import Depends
 from lib import llm_client, prompts, prosody_engine, recording_engine, session_scorer
 from lib.audio_io import AudioDecodeError
+from prisma import Json
 from lib.prisma_client import db
 from lib.session_scorer import AudioFeatures, ScoredSession
 from lib.speech_config import load_speech_config
@@ -138,23 +139,32 @@ async def submit_turn(
     if not session or session.userId != user_id:
         raise ValueError("Session not found")
     
-    speech_config = SPEECH_TYPES.get(session.speechType, SPEECH_TYPES[PublicSpeakingType.BUSINESS_PITCH])
+    speech_config = SPEECH_TYPES.get(session.speechType, SPEECH_TYPES["business_pitch"])
     
     # Process audio or text input
     if turn.audio_data:
-        # Audio processing pipeline
-        transcript, audio_features = await _process_audio(turn.audio_data)
+        # Legacy base64-upload pipeline (full prosody/SNR delivery metrics).
+        transcript, audio_features, analysis = await _process_audio(turn.audio_data)
         text_content = transcript
+    elif turn.duration_seconds is not None:
+        # Shared LiveKit voice pipeline: the voice_agent already transcribed; only the
+        # transcript + spoken duration reach us (raw audio stays in the room). Real WPM,
+        # proxy tone/clarity — matches Conversation / Baseline.
+        text_content = turn.text_content or ""
+        audio_features = AudioFeatures(transcript=text_content, duration_seconds=turn.duration_seconds)
+        analysis = None
     else:
-        # Text processing
+        # Typed text
         text_content = turn.text_content or ""
         audio_features = None
-    
+        analysis = None
+
     # Generate comprehensive scorecard
     scorecard = await _generate_scorecard(
         speech_type=str(session.speechType),
         text_content=text_content,
         audio_features=audio_features,
+        analysis=analysis,
         speech_config=speech_config,
     )
     
@@ -165,7 +175,7 @@ async def submit_turn(
             "transcript": text_content,
             "status": "completed" if turn.is_final else "in_progress",
             "completedAt": datetime.now(timezone.utc) if turn.is_final else None,
-            "scorecard": scorecard,
+            "scorecard": Json(scorecard),
         }
     )
     
@@ -215,8 +225,11 @@ async def submit_qa_response(
     
     # Process response
     if response.audio_data:
-        transcript, audio_features = await _process_audio(response.audio_data)
+        transcript, audio_features, _analysis = await _process_audio(response.audio_data)
         text_content = transcript
+    elif response.duration_seconds is not None:
+        text_content = response.text_content or ""
+        audio_features = AudioFeatures(transcript=text_content, duration_seconds=response.duration_seconds)
     else:
         text_content = response.text_content or ""
         audio_features = None
@@ -236,7 +249,7 @@ async def submit_qa_response(
             "userQaResponse": text_content,
             "status": "completed",
             "completedAt": datetime.now(timezone.utc),
-            "qaScore": qa_score,
+            "qaScore": Json(qa_score),
         }
     )
     
@@ -249,6 +262,25 @@ async def submit_qa_response(
         "updated_scorecard": updated_scorecard,
         "session_id": session_id,
     }
+
+
+async def get_voice_token(session_id: str, user_id: str) -> Dict:
+    """Mint a LiveKit room token for a spoken turn — the shared voice pipeline used by
+    Conversation / Baseline. Room name is the session_id; the generic voice_agent worker
+    auto-joins, transcribes (Silero VAD + faster-whisper), and pushes the transcript over
+    the data channel. Backend never touches raw audio here."""
+    from fastapi.responses import JSONResponse
+    from lib import livekit_tokens
+
+    session = await db.publicspeakingsession.find_unique(where={"id": session_id})
+    if not session or session.userId != user_id:
+        return JSONResponse(status_code=404, content={"error": "Session not found"})
+    if not livekit_tokens.is_configured():
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Voice mode unavailable. Use text mode instead."},
+        )
+    return livekit_tokens.mint_room_token(session_id, identity=user_id)
 
 
 async def get_session(session_id: str, user_id: str) -> Dict:
@@ -273,50 +305,74 @@ async def get_session(session_id: str, user_id: str) -> Dict:
     }
 
 
-async def _process_audio(audio_data: str) -> Tuple[str, Optional[AudioFeatures]]:
+async def _process_audio(
+    audio_data: str,
+) -> Tuple[str, Optional[AudioFeatures], Optional["recording_engine.RecordingAnalysis"]]:
     """Process audio input: decode base64, then run it through the same shared
     decode+VAD+STT+prosody pipeline Pronunciation Coach / Accent Assessment use
-    (lib/recording_engine.py) instead of duplicating that logic here."""
+    (lib/recording_engine.py) instead of duplicating that logic here.
+
+    Returns the transcript, a fully populated session_scorer.AudioFeatures (with word
+    timings + filled-pause count, so the real fluency scorer works — not the empty stub
+    Devin passed before), and the raw RecordingAnalysis so the scorecard can read real
+    prosody / SNR / rejection instead of hardcoded 75s."""
     try:
         # Frontend sends either a raw base64 string or a data: URI — strip the prefix if present.
         raw = audio_data.split(",", 1)[1] if audio_data.startswith("data:") else audio_data
         audio_bytes = base64.b64decode(raw)
         config = load_speech_config()
         analysis = recording_engine.analyze_recording(audio_bytes, config)
+        word_timings = [
+            {"word": w.word, "start": w.start, "end": w.end} for w in analysis.words
+        ]
         audio_features = AudioFeatures(
             transcript=analysis.transcript,
             duration_seconds=analysis.duration_seconds,
+            word_timings=word_timings,
             avg_db=analysis.avg_dbfs,
+            filled_pauses=session_scorer.count_filled_pauses(analysis.transcript),
         )
-        return analysis.transcript, audio_features
+        return analysis.transcript, audio_features, analysis
     except (AudioDecodeError, binascii.Error) as e:
         logger.error(f"Audio processing failed: {e}")
-        return "", None
+        return "", None, None
 
 
 async def _generate_scorecard(
     speech_type: str,
     text_content: str,
     audio_features: Optional[AudioFeatures],
+    analysis: Optional["recording_engine.RecordingAnalysis"],
     speech_config: Dict,
 ) -> Dict:
-    """Generate comprehensive scorecard based on speech analysis"""
-    
+    """Generate comprehensive scorecard based on speech analysis.
+
+    Scores are derived from the shared analysis engines — session_scorer for
+    fluency/vocabulary/pronunciation, prosody for tone variation, VAD/SNR for clarity —
+    not from the constant 75.0 placeholders. When audio was rejected (silence, too
+    quiet, too noisy) the scorecard reports that instead of fabricating a score."""
+
+    # Run the same fluency/vocabulary/pronunciation scorer the other speaking modules use.
+    if audio_features:
+        scored = session_scorer.score_audio_session(audio_features)
+    else:
+        scored = session_scorer.score_text_session(text_content)
+
     # Calculate speaking pace (PSC-US-11)
     wpm_metrics = _calculate_wpm(text_content, audio_features)
-    
+
     # Analyze filler words (PSC-US-08)
     filler_analysis = _analyze_filler_words(text_content)
-    
-    # Assess tone variation and energy (PSC-US-05, PSC-US-07)
-    tone_analysis = _analyze_tone_variation(text_content, audio_features)
-    
+
+    # Assess tone variation and energy (PSC-US-05, PSC-US-07) — real pitch range when audio present.
+    tone_analysis = _analyze_tone_variation(text_content, analysis)
+
     # Evaluate structure based on speech type
     structure_analysis = _evaluate_structure(speech_type, text_content, speech_config)
-    
-    # Voice clarity analysis (PSC-US-14)
-    clarity_analysis = _analyze_voice_clarity(audio_features)
-    
+
+    # Voice clarity analysis (PSC-US-14) — real SNR / input level, not a constant.
+    clarity_analysis = _analyze_voice_clarity(analysis)
+
     # Calculate overall scores
     scores = _calculate_overall_scores(
         speech_type=speech_type,
@@ -325,9 +381,10 @@ async def _generate_scorecard(
         tone_analysis=tone_analysis,
         structure_analysis=structure_analysis,
         clarity_analysis=clarity_analysis,
+        scored=scored,
         speech_config=speech_config,
     )
-    
+
     # Generate feedback and flags
     flags = _generate_flags(
         speech_type=speech_type,
@@ -337,13 +394,13 @@ async def _generate_scorecard(
         structure_analysis=structure_analysis,
         clarity_analysis=clarity_analysis,
     )
-    
+
     highlights = _generate_highlights(
         speech_type=speech_type,
         structure_analysis=structure_analysis,
         tone_analysis=tone_analysis,
     )
-    
+
     # Generate summary and actionable tips
     summary, actionable_tips = _generate_feedback_summary(
         speech_type=speech_type,
@@ -351,7 +408,7 @@ async def _generate_scorecard(
         flags=flags,
         speech_config=speech_config,
     )
-    
+
     return {
         "speech_type": str(speech_type),
         "input_mode": "audio" if audio_features else "text",
@@ -362,17 +419,18 @@ async def _generate_scorecard(
         "voice_clarity": scores["voice_clarity"],
         "structure": scores["structure"],
         "audience_engagement": scores["audience_engagement"],
+        "fluency": scored.fluency_score,
+        "vocabulary": scored.vocabulary_score,
+        "pronunciation": scored.pronunciation_score,
         "words_per_minute": wpm_metrics["wpm"],
         "filler_word_count": filler_analysis["count"],
         "filler_words": filler_analysis["words"],
+        "audio_rejected": analysis.rejection.value if analysis and analysis.rejection else None,
         "flags": flags,
         "highlights": highlights,
         "summary": summary,
         "actionable_tips": actionable_tips,
-        "delivery": {
-            "duration_seconds": audio_features.duration_seconds if audio_features else 0,
-            "avg_db": audio_features.avg_db if audio_features else None,
-        } if audio_features else None,
+        "delivery": scored.delivery if audio_features else None,
     }
 
 
@@ -380,15 +438,18 @@ def _calculate_wpm(text: str, audio_features: Optional[AudioFeatures]) -> Dict:
     """Calculate words per minute and pacing metrics"""
     words = text.split()
     word_count = len(words)
-    
+
+    # WPM needs real speaking time. Text submissions have none, so report it as
+    # unmeasurable ("not_applicable") rather than inventing 150 — the old default made
+    # every typed speech read as perfectly paced.
     if audio_features and audio_features.duration_seconds > 0:
-        wpm = (word_count / audio_features.duration_seconds) * 60
+        wpm = round((word_count / audio_features.duration_seconds) * 60, 1)
     else:
-        # Estimate based on average reading speed for text-only
-        wpm = 150  # Default assumption
-    
-    # Determine pacing quality
-    if IDEAL_WPM_MIN <= wpm <= IDEAL_WPM_MAX:
+        wpm = None
+
+    if wpm is None:
+        pacing_quality = "not_applicable"
+    elif IDEAL_WPM_MIN <= wpm <= IDEAL_WPM_MAX:
         pacing_quality = "optimal"
     elif wpm > RUSHED_WPM_THRESHOLD:
         pacing_quality = "rushed"
@@ -396,9 +457,9 @@ def _calculate_wpm(text: str, audio_features: Optional[AudioFeatures]) -> Dict:
         pacing_quality = "slow"
     else:
         pacing_quality = "acceptable"
-    
+
     return {
-        "wpm": round(wpm, 1),
+        "wpm": wpm,
         "word_count": word_count,
         "pacing_quality": pacing_quality,
     }
@@ -432,31 +493,41 @@ def _analyze_filler_words(text: str) -> Dict:
     }
 
 
-def _analyze_tone_variation(text: str, audio_features: Optional[AudioFeatures]) -> Dict:
-    """Analyze tone variation and vocal energy"""
-    # Text-based analysis
+def _analyze_tone_variation(
+    text: str, analysis: Optional["recording_engine.RecordingAnalysis"]
+) -> Dict:
+    """Analyze tone variation and vocal energy.
+
+    For audio, the real signal is pitch range: the prosody engine already computes
+    pitch_range_semitones (5th–95th percentile spread of the voiced F0 contour). A flat
+    delivery sits near 0; expressive speech spans ~8-12 st. That replaces the constant
+    75.0 the old code produced because it called prosody_engine.analyze() with the wrong
+    argument and swallowed the resulting exception.
+
+    For text (no audio), fall back to the sentence-length-variance heuristic — it's a
+    weak proxy, so it only flags monotone risk, it does not fabricate an energy number.
+    """
     sentences = [s.strip() for s in text.split('.') if s.strip()]
-    sentence_lengths = [len(s.split()) for s in sentences]
-    
-    # Check for monotone indication (similar sentence lengths)
-    if len(sentence_lengths) > 1:
-        length_variance = max(sentence_lengths) - min(sentence_lengths)
-        monotone_risk = length_variance < 5  # Low variance suggests monotone
+
+    if analysis is not None and analysis.prosody is not None:
+        pitch_range = float(analysis.prosody.pitch_range_semitones)
+        # Map 0 st -> 0, 10 st -> 100 (clamped). 10 st ≈ lively presentation delivery.
+        energy_score = max(0.0, min(100.0, (pitch_range / 10.0) * 100.0))
+        monotone_risk = pitch_range < 3.0  # under a minor third of spread reads as flat
+        energy_measured = True
     else:
-        monotone_risk = False
-    
-    # Audio-based analysis if available
-    energy_score = 75.0  # Default
-    if audio_features:
-        # Use prosody engine for detailed analysis
-        try:
-            prosody_result = prosody_engine.analyze(audio_features)
-            energy_score = prosody_result.get("energy", 75.0)
-        except Exception:
-            energy_score = 75.0
-    
+        sentence_lengths = [len(s.split()) for s in sentences]
+        if len(sentence_lengths) > 1:
+            length_variance = max(sentence_lengths) - min(sentence_lengths)
+            monotone_risk = length_variance < 5
+        else:
+            monotone_risk = False
+        energy_score = None  # not measurable from text
+        energy_measured = False
+
     return {
         "energy_score": energy_score,
+        "energy_measured": energy_measured,
         "monotone_risk": monotone_risk,
         "sentence_count": len(sentences),
     }
@@ -501,48 +572,70 @@ def _evaluate_structure(speech_type: str, text: str, speech_config: Dict) -> Dic
     }
 
 
-def _analyze_voice_clarity(audio_features: Optional[AudioFeatures]) -> Dict:
-    """Analyze voice clarity and projection (PSC-US-14)"""
-    if not audio_features:
+def _analyze_voice_clarity(
+    analysis: Optional["recording_engine.RecordingAnalysis"],
+) -> Dict:
+    """Analyze voice clarity and projection (PSC-US-14) from real acoustic signals.
+
+    Clarity tracks SNR (how far the voice sits above the noise floor); projection tracks
+    average input level (dBFS). Both come straight from the VAD/level analysis the shared
+    recording engine already ran. Text mode has no audio, so clarity is reported as
+    not-measured (None) rather than a placeholder 75.0.
+    """
+    if analysis is None:
         return {
-            "clarity_score": 75.0,
-            "projection_score": 75.0,
+            "clarity_score": None,
+            "projection_score": None,
+            "measured": False,
             "issues": [],
         }
-    
+
     issues = []
-    clarity_score = 75.0
-    projection_score = 75.0
-    
-    # Check for quiet microphone (hardware issue)
-    if audio_features.avg_db and audio_features.avg_db <= MIC_QUIET_DB:
+
+    # If the whole recording was rejected, surface why — don't score fake clarity on it.
+    if analysis.rejection is not None:
+        reason_messages = {
+            "no_speech_detected": "No speech was detected. Please record again and speak clearly.",
+            "audio_too_quiet": "Microphone volume is very low. Please check device settings.",
+            "background_noise_too_high": "Too much background noise. Find a quieter space and retry.",
+        }
+        issues.append({
+            "type": analysis.rejection.value,
+            "message": reason_messages.get(
+                analysis.rejection.value, "Recording could not be analyzed."
+            ),
+        })
+        return {
+            "clarity_score": 0.0,
+            "projection_score": 0.0,
+            "measured": True,
+            "issues": issues,
+        }
+
+    # Clarity from SNR: <=8 dB poor (~50), >=25 dB excellent (~100).
+    snr = analysis.snr_db
+    clarity_score = max(0.0, min(100.0, 50.0 + (snr - 8.0) * (50.0 / 17.0)))
+
+    # Projection from input level: too quiet or clipping both hurt.
+    avg_db = analysis.avg_dbfs
+    projection_score = max(0.0, min(100.0, (avg_db - MIC_QUIET_DB) * (100.0 / 42.0)))
+    if avg_db <= MIC_QUIET_DB:
         issues.append({
             "type": "microphone_quiet",
             "message": "Microphone volume is very low. Please check device settings.",
         })
-        projection_score = 50.0  # Don't penalize user for hardware
-    
-    # Check for clipping
-    if audio_features.avg_db and audio_features.avg_db >= CLIPPING_DB:
+        projection_score = 50.0  # hardware issue — don't over-penalize the speaker
+    elif avg_db >= CLIPPING_DB:
         issues.append({
             "type": "audio_clipping",
             "message": "Audio distortion detected. Please move farther from microphone.",
         })
-        clarity_score = 50.0
-    
-    # Check for volume consistency (not currently produced by the recording pipeline —
-    # guarded rather than assumed present since AudioFeatures doesn't declare this field).
-    db_variance = getattr(audio_features, "db_variance", None)
-    if db_variance and db_variance > 15:
-        issues.append({
-            "type": "volume_inconsistent",
-            "message": "Voice volume varies significantly. Try to maintain consistent projection.",
-        })
-        clarity_score -= 10
-    
+        clarity_score = min(clarity_score, 50.0)
+
     return {
-        "clarity_score": max(0.0, min(100.0, clarity_score)),
-        "projection_score": max(0.0, min(100.0, projection_score)),
+        "clarity_score": round(max(0.0, min(100.0, clarity_score)), 1),
+        "projection_score": round(max(0.0, min(100.0, projection_score)), 1),
+        "measured": True,
         "issues": issues,
     }
 
@@ -554,31 +647,47 @@ def _calculate_overall_scores(
     tone_analysis: Dict,
     structure_analysis: Dict,
     clarity_analysis: Dict,
+    scored: "session_scorer.ScoredSession",
     speech_config: Dict,
 ) -> Dict:
-    """Calculate overall scores based on all analyses"""
-    
-    # Base scores
-    pacing_score = 100.0
-    if wpm_metrics["pacing_quality"] == "rushed":
+    """Calculate overall scores based on all analyses.
+
+    Where a dimension can't be measured (text has no pacing/clarity/energy), we fall back
+    to the session_scorer fluency score — a real signal derived from the submission —
+    instead of the old constant 75.0 placeholders.
+    """
+    fluency = scored.fluency_score
+
+    # Base scores. Text submissions have no measurable pace, so pacing tracks written
+    # fluency rather than an invented "optimal 100".
+    if wpm_metrics["pacing_quality"] == "not_applicable":
+        pacing_score = fluency
+    elif wpm_metrics["pacing_quality"] == "rushed":
         pacing_score = 60.0
     elif wpm_metrics["pacing_quality"] == "slow":
         pacing_score = 70.0
-    
+    else:
+        pacing_score = 100.0
+
     # Penalize excessive filler words
     filler_penalty = min(filler_analysis["count"] * 2, 30)  # Max 30 point penalty
-    
-    # Tone variation score
+
+    # Tone variation score — real pitch spread when audio, else fluency proxy.
     tone_score = tone_analysis["energy_score"]
+    if tone_score is None:
+        tone_score = fluency
     if tone_analysis["monotone_risk"]:
         tone_score -= 20
-    
+    tone_score = max(0.0, min(100.0, tone_score))
+
     # Structure score
     structure_score = structure_analysis["structure_score"]
-    
-    # Clarity score
+
+    # Clarity score — real SNR when audio, else fluency proxy.
     clarity_score = clarity_analysis["clarity_score"]
-    
+    if clarity_score is None:
+        clarity_score = fluency
+
     # Calculate overall based on speech type priorities
     if speech_config.get("prioritize_energy"):
         # Motivational: prioritize tone and energy

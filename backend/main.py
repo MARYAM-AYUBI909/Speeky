@@ -41,6 +41,7 @@ from routers.scenario_routes import router as scenario_router
 from routers.session_memory_routes import router as session_memory_router
 from routers.vocabulary_progress_routes import router as vocabulary_progress_router
 from routers.public_speaking_routes import router as public_speaking_router
+from routers.rewrite_routes import router as rewrite_router
 from utils.app_error import AppError
 
 
@@ -99,6 +100,7 @@ app.include_router(accent_router, prefix="/api/accent-assessment")
 app.include_router(vocabulary_progress_router, prefix="/api/vocabulary-progress")
 app.include_router(practice_time_router, prefix="/api/practice-time")
 app.include_router(public_speaking_router, prefix="/api/public-speaking")
+app.include_router(rewrite_router, prefix="/api/rewrite")
 
 # Local-folder avatar storage, exposed to frontend as static files
 _uploads_dir = os.path.join(os.path.dirname(__file__), "uploads")

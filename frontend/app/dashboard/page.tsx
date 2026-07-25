@@ -12,6 +12,7 @@ import {
   Users,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { AccentStalenessBanner } from "@/components/dashboard/AccentStalenessBanner";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/contexts/AuthContext";
 import {
@@ -67,6 +68,7 @@ export default function DashboardPage() {
 
   return (
     <div className="flex flex-col gap-8">
+      <AccentStalenessBanner />
       <div className="flex animate-fade-up flex-col justify-between gap-4 sm:flex-row sm:items-start">
         <div>
           <h1 className="font-serif text-3xl font-semibold tracking-tight text-foreground">

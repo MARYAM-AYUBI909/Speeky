@@ -371,6 +371,9 @@ async def _send_message(user_id: str, session_id: str, req: SendMessageSchema) -
     session["turns"].append({
         "role": "user", "content": redacted_text, "input_mode": req.input_mode,
         "correction_chip": chip_result["chip"], "created_at": now,
+        # Word-level timing from the STT agent, kept for pronunciation_coach's
+        # word-level scoring/highlighting (US-79) — the turn itself doesn't use it.
+        "word_timings": req.audio_features.word_timings if req.audio_features else [],
     })
 
     if session_ended:
@@ -434,6 +437,12 @@ async def _end_session(user_id: str, session_id: str) -> Dict:
     duration = (_now() - session["started_at"]).total_seconds()
     session["status"] = "completed"
     session["completed_at"] = _now()
+    # Persisted (not just returned) so a later accent re-baseline request (US-84)
+    # can reuse this session's real scores instead of re-scoring or accepting
+    # client-supplied numbers.
+    session["fluency_score"] = scored.fluency_score
+    session["vocabulary_score"] = scored.vocabulary_score
+    session["pronunciation_score"] = scored.pronunciation_score
     await kv_store.store.update(NAMESPACE, session_id, session)
 
     new_facts = await _extract_and_store_facts(user_id, [t["content"] for t in user_turns])
@@ -450,6 +459,19 @@ async def _end_session(user_id: str, session_id: str) -> Dict:
         ))
     except Exception:
         pass  # best-effort — conversation scoring must not fail because memory logging did
+
+    # US-84/US-83: record this session's real scores as an accent-assessment drill
+    # so accent-profile staleness/dispute have real data to operate on.
+    try:
+        from services.accent_assessment_service import record_conversation_drill
+
+        await record_conversation_drill(
+            user_id, session_id,
+            {"fluency": scored.fluency_score, "vocabulary": scored.vocabulary_score,
+             "pronunciation": scored.pronunciation_score},
+        )
+    except Exception:
+        pass  # best-effort — conversation scoring must not fail because accent logging did
 
     return {
         "session_id": session_id, "status": session["status"], "duration_seconds": duration,

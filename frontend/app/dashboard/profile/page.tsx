@@ -8,6 +8,9 @@ import { PerformanceMemorySection } from "@/components/dashboard/profile/Perform
 import { PrivacyConsentSection } from "@/components/dashboard/profile/PrivacyConsentSection";
 import { ConversationMemorySection } from "@/components/dashboard/profile/ConversationMemorySection";
 import { CodeSwitchSection } from "@/components/dashboard/profile/CodeSwitchSection";
+import { CodeSwitchWordListSection } from "@/components/dashboard/profile/CodeSwitchWordListSection";
+import { TargetAccentSection } from "@/components/dashboard/profile/TargetAccentSection";
+import { AccessibilityProfileSection } from "@/components/dashboard/profile/AccessibilityProfileSection";
 import { SecuritySection } from "@/components/dashboard/profile/SecuritySection";
 import { DangerZoneSection } from "@/components/dashboard/profile/DangerZoneSection";
 
@@ -28,7 +31,10 @@ export default function ProfilePage() {
       <PerformanceMemorySection />
       <PrivacyConsentSection />
       <ConversationMemorySection />
+      <TargetAccentSection />
+      <AccessibilityProfileSection />
       <CodeSwitchSection />
+      <CodeSwitchWordListSection />
       <SecuritySection />
       <DangerZoneSection />
     </div>

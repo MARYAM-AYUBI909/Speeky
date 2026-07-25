@@ -4,6 +4,7 @@ import * as React from "react";
 import { useParams, useRouter } from "next/navigation";
 import { CheckCircle2, PhoneOff, Volume2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
 import {
   endConversationSession,
@@ -13,6 +14,78 @@ import {
   type ConversationTurn,
   type EndConversationResult,
 } from "@/lib/conversation";
+import { scoreConversationTurn, type SentenceScoreResult } from "@/lib/pronunciationCoach";
+import { ScoreDisputeButton } from "@/components/dashboard/ScoreDisputeButton";
+
+const TIER_CLASSES: Record<string, string> = {
+  green: "bg-success/15 text-success",
+  orange: "bg-warning/15 text-warning",
+  red: "bg-danger/15 text-danger",
+  gray: "bg-muted text-muted-foreground line-through",
+  unscorable: "bg-muted text-muted-foreground",
+};
+
+/**
+ * US-79/US-74: word-level pronunciation highlighting for one audio turn,
+ * fetched from the real shared pipeline (pronunciation_coach_service.score_turn).
+ * Only ever renders for a turn with input_mode "audio" — the current
+ * conversation UI is text-only (no mic capture), so this real, working code
+ * path has nothing to attach to today. See the project summary.
+ */
+function PronunciationBreakdown({ sessionId, turnIndex }: { sessionId: string; turnIndex: number }) {
+  const [result, setResult] = React.useState<SentenceScoreResult | null>(null);
+  const [status, setStatus] = React.useState<"idle" | "loading" | "error">("idle");
+  const [message, setMessage] = React.useState<string | null>(null);
+
+  async function handleScore() {
+    setStatus("loading");
+    setMessage(null);
+    try {
+      const response = await scoreConversationTurn(sessionId, turnIndex);
+      if (response.result) {
+        setResult(response.result);
+        setStatus("idle");
+      } else {
+        // US-74: outage/retry/hard-failure states — real backend status, not a crash.
+        setMessage(response.message);
+        setStatus("error");
+      }
+    } catch (err) {
+      setMessage(err instanceof ApiError ? err.message : "Couldn't score this turn.");
+      setStatus("error");
+    }
+  }
+
+  if (result) {
+    return (
+      <p className="mt-1.5 flex flex-wrap gap-1 text-sm">
+        {result.words.map((w) => (
+          <span
+            key={w.index}
+            title={w.note}
+            className={cn("rounded px-1", TIER_CLASSES[w.tier] ?? "")}
+          >
+            {w.target_word}
+          </span>
+        ))}
+      </p>
+    );
+  }
+
+  return (
+    <div className="mt-1.5">
+      <button
+        type="button"
+        onClick={handleScore}
+        disabled={status === "loading"}
+        className="text-[11px] text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+      >
+        {status === "loading" ? "Scoring pronunciation…" : "View pronunciation breakdown"}
+      </button>
+      {status === "error" && message ? <p className="mt-1 text-[11px] text-danger">{message}</p> : null}
+    </div>
+  );
+}
 
 export default function ConversationSessionPage() {
   const params = useParams<{ sessionId: string }>();
@@ -109,18 +182,23 @@ export default function ConversationSessionPage() {
             <p className="mt-1 text-xl font-semibold text-foreground">
               {Math.round(summary.fluency_score)}
             </p>
+            <ScoreDisputeButton assessmentId={summary.session_id} metricName="fluency" metricLabel="Fluency" />
           </div>
           <div className="rounded-xl border border-border bg-surface-elevated p-4 text-center shadow-sm">
             <p className="text-xs text-muted-foreground">Vocabulary</p>
             <p className="mt-1 text-xl font-semibold text-foreground">
               {Math.round(summary.vocabulary_score)}
             </p>
+            <ScoreDisputeButton assessmentId={summary.session_id} metricName="vocabulary" metricLabel="Vocabulary" />
           </div>
           <div className="rounded-xl border border-border bg-surface-elevated p-4 text-center shadow-sm">
             <p className="text-xs text-muted-foreground">Pronunciation</p>
             <p className="mt-1 text-xl font-semibold text-foreground">
               {summary.pronunciation_score !== null ? Math.round(summary.pronunciation_score) : "—"}
             </p>
+            {summary.pronunciation_score !== null ? (
+              <ScoreDisputeButton assessmentId={summary.session_id} metricName="pronunciation" metricLabel="Pronunciation" />
+            ) : null}
           </div>
         </div>
         {summary.new_memory_facts.length > 0 ? (
@@ -187,6 +265,9 @@ export default function ConversationSessionPage() {
                   <span className="font-medium text-success">{turn.correction_chip.corrected}</span>
                   <p className="mt-0.5 text-muted-foreground">{turn.correction_chip.explanation}</p>
                 </div>
+              ) : null}
+              {turn.role === "user" && turn.input_mode === "audio" ? (
+                <PronunciationBreakdown sessionId={params.sessionId} turnIndex={i} />
               ) : null}
             </div>
           ))}

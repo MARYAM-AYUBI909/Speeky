@@ -51,6 +51,18 @@ export interface MemoryFact {
   updated_at: string;
 }
 
+export interface ConversationSessionSummary {
+  session_id: string;
+  topic_label: string;
+  status: string;
+  started_at: string;
+  completed_at: string | null;
+}
+
+export function listConversationSessions() {
+  return api<{ sessions: ConversationSessionSummary[] }>("/conversation/sessions");
+}
+
 export function listTopics() {
   return api<{ topics: ConversationTopic[] }>("/conversation/topics");
 }

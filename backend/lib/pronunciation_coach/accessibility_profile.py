@@ -27,6 +27,7 @@ from typing import Dict, Optional, Sequence
 
 from lib.pronunciation_coach.pronunciation_pipeline import (
     PronunciationPipeline,
+    PronunciationPipelineConfig,
     SentenceScoreResult,
     WordAttempt,
 )
@@ -136,6 +137,7 @@ def score_with_accessibility(
     attempts: Sequence[Optional[WordAttempt]],
     profile: AccessibilityProfile,
     accent_calibration: bool = False,
+    config_override: Optional[PronunciationPipelineConfig] = None,
 ) -> SentenceScoreResult:
     """
     Score a sentence through the shared pipeline, applying the
@@ -144,6 +146,14 @@ def score_with_accessibility(
     E-03: for a user with no disclosed condition (profile.opted_in is
     False), this is a pure pass-through to PronunciationPipeline - casual
     nervous disfluency gets the standard, unmodified fluency penalty.
+
+    `config_override` (added for the accent_assessment wiring) lets a
+    caller pass an accent-resolved PronunciationPipelineConfig (e.g. from
+    pipeline.resolve_config_for_user()) through to score_sentence() without
+    mutating pipeline.config - same optional, backward-compatible
+    parameter score_sentence() itself already exposes. Existing callers
+    that never pass it get byte-identical behavior to before this param
+    existed.
     """
     exempt_indices = set()
     if profile.opted_in:
@@ -158,6 +168,7 @@ def score_with_accessibility(
         attempts=attempts,
         accent_calibration=accent_calibration,
         accessibility_exempt_indices=exempt_indices,
+        config_override=config_override,
     )
 
     result.scoring_profile = ACCESSIBILITY_PROFILE_LABEL if profile.opted_in else STANDARD_PROFILE_LABEL

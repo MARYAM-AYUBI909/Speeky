@@ -11,11 +11,8 @@ import {
   Users,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-<<<<<<< HEAD
 import { AccentStalenessBanner } from "@/components/dashboard/AccentStalenessBanner";
-=======
 import { DailyChallengeCard } from "@/components/dashboard/DailyChallengeCard";
->>>>>>> origin/main
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/contexts/AuthContext";
 import {

@@ -16,6 +16,11 @@ export interface VoiceTokenResult {
   room: string;
 }
 
+export interface AudioFeatures {
+  duration_seconds: number;
+  word_timings: { word: string; start: number; end: number }[];
+}
+
 // Ceiling for how long stopVoice() waits for an in-flight transcript before giving up
 // and disconnecting anyway — matches the product's stated max latency budget.
 const STOP_WAIT_MS = 15000;
@@ -30,7 +35,7 @@ const STOP_WAIT_MS = 15000;
  */
 export function useLiveKitVoice(
   fetchToken: () => Promise<VoiceTokenResult>,
-  onTranscript: (text: string) => void,
+  onTranscript: (text: string, audioFeatures: AudioFeatures | null) => void,
 ) {
   const [isVoiceActive, setIsVoiceActive] = React.useState(false);
   const [isConnectingVoice, setIsConnectingVoice] = React.useState(false);
@@ -49,6 +54,9 @@ export function useLiveKitVoice(
   // Set by stopVoice() while it's waiting; the DataReceived handler resolves it early
   // the moment the transcript it's waiting for actually arrives.
   const pendingStopResolveRef = React.useRef<(() => void) | null>(null);
+  // Stores the audio features from the most recent transcript — caller reads this
+  // via getLastAudioFeatures() before clearing it on message send.
+  const lastAudioFeaturesRef = React.useRef<AudioFeatures | null>(null);
 
   const startVoice = React.useCallback(async () => {
     if (roomRef.current) return;
@@ -100,7 +108,13 @@ export function useLiveKitVoice(
           utteranceInFlightRef.current = false;
           pendingStopResolveRef.current?.();
           if (!text) return;
-          onTranscriptRef.current(text);
+          // Store audio features from the agent so the caller can attach them to the sent message.
+          const audioFeatures: AudioFeatures | null =
+            typeof data.duration_seconds === "number" && Array.isArray(data.word_timings)
+              ? { duration_seconds: data.duration_seconds, word_timings: data.word_timings }
+              : null;
+          lastAudioFeaturesRef.current = audioFeatures;
+          onTranscriptRef.current(text, audioFeatures);
           setVoiceStatus("Heard you — review and hit Send.");
         } catch (err) {
           console.error("Failed to parse voice data payload:", err);
@@ -215,6 +229,12 @@ export function useLiveKitVoice(
     };
   }, []);
 
+  const getLastAudioFeatures = React.useCallback((): AudioFeatures | null => {
+    const features = lastAudioFeaturesRef.current;
+    lastAudioFeaturesRef.current = null; // consume once — clear after reading
+    return features;
+  }, []);
+
   return {
     isVoiceActive,
     isConnectingVoice,
@@ -223,5 +243,6 @@ export function useLiveKitVoice(
     error,
     startVoice,
     stopVoice,
+    getLastAudioFeatures,
   };
 }

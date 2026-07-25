@@ -10,13 +10,20 @@ agent dispatch — no per-session launch needed). For each subscribed audio trac
 it runs Silero VAD to find speech segments, transcribes each segment locally
 with faster-whisper, and sends results over the room's LiveKit data channel:
 
-    topic="voice_transcript", payload={"text": "..."}   — final transcript
+    topic="voice_transcript", payload={
+        "text": "...",
+        "duration_seconds": 1.23,
+        "word_timings": [{"word": "hello", "start": 0.0, "end": 0.4}, ...]
+    }
     topic="voice_status",     payload={"status": "speaking"|"idle"}  — live state
 
 The frontend (see ConversationSessionPage's RoomEvent.DataReceived handler)
 appends transcript text into the message input box — the user reviews/edits it
 and hits Send, reusing the existing POST /conversation/sessions/{id}/messages
-path. The status packets drive a pulsing mic dot so the user sees when speech
+path. The audio_features (duration_seconds + word_timings) are stored locally
+in the frontend and sent alongside the message so the backend records this as
+an "audio" turn, enabling pronunciation scoring (US-79/74).
+The status packets drive a pulsing mic dot so the user sees when speech
 is being detected. This worker never calls the backend directly and never
 auto-sends on the user's behalf.
 """
@@ -49,25 +56,66 @@ model = WhisperModel("base", device="cpu", compute_type="int8")
 _executor = ThreadPoolExecutor(max_workers=1)
 
 
-def transcribe(frame: rtc.AudioFrame) -> str:
-    # Hand faster-whisper a WAV file-like object (via to_wav_bytes(), which correctly tags the frame's real sample rate .
-    # Silero's VAD event frame is at the track's native rate, e.g. 48kHz, NOT the 16kHz Silero resamples to internally for its own inference) instead of a raw ndarray.
+def transcribe(frame: rtc.AudioFrame) -> dict:
+    """Transcribe one speech frame, returning text, word timings, and duration.
+
+    Returns a dict with:
+        text           — full transcript string
+        duration_seconds — utterance length in seconds from frame samples
+        word_timings   — list of {word, start, end} dicts from whisper's
+                         word_timestamps output. Empty list if no words found.
+    """
     wav_bytes = frame.to_wav_bytes()
-    # temperature=0: single decode pass. faster-whisper's default temperature-fallback
-    # ladder retries up to 6x on low-confidence audio, turning one utterance into a
-    # 7-10s+ block — the user reviews/edits the transcript before sending anyway, so a
-    # rougher single-pass result beats a more "accurate" one that misses the latency budget.
-    segments, _info = model.transcribe(io.BytesIO(wav_bytes), beam_size=5, temperature=0)
-    return " ".join(seg.text.strip() for seg in segments).strip()
+
+    # Calculate real duration from frame metadata rather than guessing.
+    # AudioFrame.samples_per_channel / sample_rate = seconds of audio.
+    duration_seconds = frame.samples_per_channel / frame.sample_rate if frame.sample_rate > 0 else 0.0
+
+    # temperature=0: single decode pass (avoids 7-10s temperature-fallback retries).
+    # word_timestamps=True: get per-word start/end times for pronunciation scoring.
+    segments, _info = model.transcribe(
+        io.BytesIO(wav_bytes),
+        beam_size=5,
+        temperature=0,
+        word_timestamps=True,
+    )
+
+    text_parts = []
+    word_timings = []
+
+    for segment in segments:
+        text = segment.text.strip()
+        if text:
+            text_parts.append(text)
+        for word in segment.words or []:
+            cleaned = word.word.strip()
+            if cleaned:
+                word_timings.append({
+                    "word": cleaned,
+                    "start": round(word.start, 3),
+                    "end": round(word.end, 3),
+                })
+
+    return {
+        "text": " ".join(text_parts).strip(),
+        "duration_seconds": round(duration_seconds, 3),
+        "word_timings": word_timings,
+    }
 
 
-async def publish_transcript(room: rtc.Room, text: str) -> None:
-    if not text:
+async def publish_transcript(room: rtc.Room, result: dict) -> None:
+    """Publish the transcript, duration, and word timings to the frontend."""
+    if not result.get("text"):
         return
-    payload = json.dumps({"text": text}).encode("utf-8")
+    payload = json.dumps(result).encode("utf-8")
     try:
         await room.local_participant.publish_data(payload, reliable=True, topic="voice_transcript")
-        logger.info("Sent transcript to frontend: %r", text)
+        logger.info(
+            "Sent transcript to frontend: %r (%d words, %.2fs)",
+            result["text"],
+            len(result["word_timings"]),
+            result["duration_seconds"],
+        )
     except Exception:
         logger.exception("Failed to publish transcript over data channel")
 
@@ -100,11 +148,11 @@ async def process_audio(track: rtc.Track, identity: str, vad: silero.VAD, room: 
                 # Silero's END_OF_SPEECH event carries the whole utterance as a single
                 # already-combined frame (see livekit/plugins/silero/vad.py's
                 # _copy_speech_buffer) — no need to concatenate multiple frames.
-                text = await asyncio.get_running_loop().run_in_executor(
+                result = await asyncio.get_running_loop().run_in_executor(
                     _executor, transcribe, event.frames[0]
                 )
-                logger.info("Speech ENDED (%s): %r", identity, text)
-                await publish_transcript(room, text)
+                logger.info("Speech ENDED (%s): %r", identity, result["text"])
+                await publish_transcript(room, result)
 
     await asyncio.gather(forward_frames(), read_vad_events())
 

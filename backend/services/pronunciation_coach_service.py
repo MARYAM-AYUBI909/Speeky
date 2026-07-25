@@ -290,7 +290,7 @@ async def get_next_review_word_endpoint(user_id: str = Depends(require_auth)):
 
 async def dismiss_trouble_word_endpoint(pattern_key: str, user_id: str = Depends(require_auth)):
     return await dismiss_trouble_word(user_id, pattern_key)
-Pronunciation Coach (GAP-03 / GAP-04 / GAP-05, US-71/72/73), the Retry Loop Mechanic
+"""Pronunciation Coach (GAP-03 / GAP-04 / GAP-05, US-71/72/73), the Retry Loop Mechanic
 (US-071 / US-78), and Session Interruption Recovery (GAP-09) — one continuous session
 flow: practice a phoneme-targeted sentence, retry specific words, resume if interrupted.
 

@@ -1,7 +1,3 @@
-<<<<<<< HEAD
-const nextConfig = {
-  /* config options here */
-=======
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   allowedDevOrigins: [
@@ -262,7 +258,6 @@ const nextConfig = {
     "192.168.18.253",
     "192.168.18.254",
   ],
->>>>>>> origin/main
 };
 
 export default nextConfig;

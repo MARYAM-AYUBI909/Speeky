@@ -384,12 +384,9 @@ async def _send_message(user_id: str, session_id: str, req: SendMessageSchema) -
     session["turns"].append({
         "role": "user", "content": redacted_text, "input_mode": req.input_mode,
         "correction_chip": chip_result["chip"], "created_at": now,
-<<<<<<< HEAD
         # Word-level timing from the STT agent, kept for pronunciation_coach's
         # word-level scoring/highlighting (US-79) — the turn itself doesn't use it.
-=======
         "duration_seconds": req.audio_features.duration_seconds if req.audio_features else 0.0,
->>>>>>> origin/main
         "word_timings": req.audio_features.word_timings if req.audio_features else [],
     })
 

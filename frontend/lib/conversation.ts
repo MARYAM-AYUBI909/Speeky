@@ -102,7 +102,16 @@ export function getConversationVoiceToken(sessionId: string) {
 
 export function sendConversationMessage(
   sessionId: string,
-  data: { text: string; input_mode?: string; show_corrections?: boolean }
+  data: {
+    text: string;
+    input_mode?: string;
+    show_corrections?: boolean;
+    audio_features?: {
+      transcript: string;
+      duration_seconds: number;
+      word_timings: { word: string; start: number; end: number }[];
+    };
+  }
 ) {
   return api<SendMessageResult>(`/conversation/sessions/${sessionId}/messages`, {
     method: "POST",

@@ -1,16 +1,11 @@
 "use client";
-<<<<<<< HEAD
-=======
 
-import { Lock } from "lucide-react";
+import * as React from "react";
+import { Lock, TrendingUp, X } from "lucide-react";
 import { AccentProgressTracker } from "@/components/dashboard/progress/AccentProgressTracker";
 import { PracticeTimeMilestones } from "@/components/dashboard/progress/PracticeTimeMilestones";
 import { VocabularyGrowthTracker } from "@/components/dashboard/progress/VocabularyGrowthTracker";
 import { useAssessmentAccess } from "@/contexts/AssessmentContext";
->>>>>>> origin/main
-
-import * as React from "react";
-import { TrendingUp, X } from "lucide-react";
 import { ApiError } from "@/lib/api";
 import { dismissTroubleWord, getActiveTroubleWords, type TroubleWordEntry } from "@/lib/pronunciationCoach";
 
@@ -20,18 +15,7 @@ const STATUS_LABEL: Record<TroubleWordEntry["status"], string> = {
   mastered: "Mastered",
 };
 
-/**
- * US-75: Cross-Session Trouble Words Bank & Spaced Repetition. Real data
- * from backend/lib/pronunciation_coach/trouble_words.py via
- * /api/pronunciation-coach/trouble-words.
- *
- * Honest note: this list will be empty until a conversation turn is scored
- * for pronunciation (US-79), which itself only happens for AUDIO turns —
- * the current conversation UI is text-only, so this page's real E-03 empty
- * state is what most users will see today. See the project summary for why.
- */
-export default function ProgressPage() {
-<<<<<<< HEAD
+function TroubleWordsSection() {
   const [words, setWords] = React.useState<TroubleWordEntry[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [busyKey, setBusyKey] = React.useState<string | null>(null);
@@ -58,27 +42,29 @@ export default function ProgressPage() {
     }
   }
 
+  if (words === null) {
+    return <p className="text-sm text-muted-foreground">Loading trouble words…</p>;
+  }
+
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex flex-col gap-4 mt-6">
       <div>
-        <h1 className="font-serif text-2xl font-semibold text-foreground">Progress</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
+        <h2 className="font-serif text-xl font-semibold text-foreground">Trouble Words</h2>
+        <p className="text-sm text-muted-foreground">
           Words that need repeated practice, tracked across sessions.
         </p>
       </div>
 
       {error ? <p className="text-sm text-danger">{error}</p> : null}
 
-      {words === null ? (
-        <p className="text-sm text-muted-foreground">Loading…</p>
-      ) : words.length === 0 ? (
-        <div className="flex min-h-[40vh] flex-col items-center justify-center gap-4 rounded-2xl border border-dashed border-border p-12 text-center">
-          <span className="flex h-14 w-14 items-center justify-center rounded-full bg-secondary text-primary">
-            <TrendingUp className="h-6 w-6" aria-hidden="true" />
+      {words.length === 0 ? (
+        <div className="flex min-h-[25vh] flex-col items-center justify-center gap-4 rounded-2xl border border-dashed border-border p-8 text-center">
+          <span className="flex h-12 w-12 items-center justify-center rounded-full bg-secondary text-primary">
+            <TrendingUp className="h-5 w-5" aria-hidden="true" />
           </span>
           <div className="flex flex-col gap-1">
-            <h2 className="font-serif text-xl font-semibold text-foreground">No trouble words yet</h2>
-            <p className="max-w-sm text-sm text-muted-foreground">
+            <h3 className="font-serif text-lg font-semibold text-foreground">No trouble words yet</h3>
+            <p className="max-w-sm text-xs text-muted-foreground">
               Words you consistently mispronounce across separate sessions will show up here
               for focused, spaced-repetition practice.
             </p>
@@ -117,7 +103,12 @@ export default function ProgressPage() {
             </li>
           ))}
         </ul>
-=======
+      )}
+    </div>
+  );
+}
+
+export default function ProgressPage() {
   const { access } = useAssessmentAccess();
   const isUnlocked = access?.access_level === "full_access";
 
@@ -143,8 +134,8 @@ export default function ProgressPage() {
           <VocabularyGrowthTracker />
           <PracticeTimeMilestones />
           <AccentProgressTracker />
+          <TroubleWordsSection />
         </div>
->>>>>>> origin/main
       )}
     </div>
   );

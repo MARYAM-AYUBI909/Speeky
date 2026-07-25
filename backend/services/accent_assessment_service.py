@@ -1,5 +1,4 @@
-"""
-Accent Assessment — Rhythm & Stress Patterns (US-93): read a longer passage aloud,
+"""Accent Assessment — Rhythm & Stress Patterns (US-93): read a longer passage aloud,
 get 4 separate dimension scores (pronunciation, stress pattern, rhythm, intonation,
 clarity) plus weak-point detection. Built on lib/recording_engine.py (Story #1) and
 reuses lib/recording_engine.classify_word_status — the same per-word classification

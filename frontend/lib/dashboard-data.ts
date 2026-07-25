@@ -11,6 +11,7 @@ import {
   UtensilsCrossed,
   Users,
   Volume2,
+  Wand2,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -26,6 +27,7 @@ export const DASHBOARD_NAV_LINKS: DashboardNavLink[] = [
   { label: "Pronunciation", href: "/dashboard/pronunciation-coach", icon: Volume2 },
   { label: "Accent", href: "/dashboard/accent-assessment", icon: Sparkles },
   { label: "Public Speaking", href: "/dashboard/public-speaking", icon: Mic },
+  { label: "Rewrite Lab", href: "/dashboard/rewrite", icon: Wand2 },
   { label: "Progress", href: "/dashboard/progress", icon: TrendingUp },
   { label: "Profile", href: "/dashboard/profile", icon: User },
 ];

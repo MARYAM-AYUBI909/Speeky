@@ -23,6 +23,9 @@ import {
 } from "@/lib/conversation";
 import { scoreConversationTurn, type SentenceScoreResult } from "@/lib/pronunciationCoach";
 import { ScoreDisputeButton } from "@/components/dashboard/ScoreDisputeButton";
+import { playText } from "@/lib/tts";
+import { useAutoScroll } from "@/lib/useAutoScroll";
+import { useLiveKitVoice, type AudioFeatures, type VoiceFeatures } from "@/lib/useLiveKitVoice";
 
 const TIER_CLASSES: Record<string, string> = {
   green: "bg-success/15 text-success",
@@ -35,9 +38,7 @@ const TIER_CLASSES: Record<string, string> = {
 /**
  * US-79/US-74: word-level pronunciation highlighting for one audio turn,
  * fetched from the real shared pipeline (pronunciation_coach_service.score_turn).
- * Only ever renders for a turn with input_mode "audio" — the current
- * conversation UI is text-only (no mic capture), so this real, working code
- * path has nothing to attach to today. See the project summary.
+ * Only ever renders for a turn with input_mode "audio".
  */
 function PronunciationBreakdown({ sessionId, turnIndex }: { sessionId: string; turnIndex: number }) {
   const [result, setResult] = React.useState<SentenceScoreResult | null>(null);
@@ -93,9 +94,7 @@ function PronunciationBreakdown({ sessionId, turnIndex }: { sessionId: string; t
     </div>
   );
 }
-import { playText } from "@/lib/tts";
-import { useAutoScroll } from "@/lib/useAutoScroll";
-import { useLiveKitVoice } from "@/lib/useLiveKitVoice";
+
 
 export default function ConversationSessionPage() {
   const params = useParams<{ sessionId: string }>();
@@ -123,7 +122,19 @@ export default function ConversationSessionPage() {
     () => getConversationVoiceToken(params.sessionId),
     [params.sessionId],
   );
-  const onTranscript = React.useCallback((text: string) => {
+  // Stores the latest audio features from the voice agent so handleSend can
+  // attach them to the message and mark the turn as input_mode="audio".
+  const pendingAudioFeaturesRef = React.useRef<{ duration_seconds: number; word_timings: { word: string; start: number; end: number }[] } | null>(null);
+  const onTranscript = React.useCallback((text: string, audioFeatures?: AudioFeatures | VoiceFeatures) => {
+    pendingAudioFeaturesRef.current =
+      audioFeatures &&
+      Array.isArray((audioFeatures as AudioFeatures).word_timings) &&
+      typeof (audioFeatures as AudioFeatures).duration_seconds === "number"
+        ? {
+            duration_seconds: (audioFeatures as AudioFeatures).duration_seconds,
+            word_timings: (audioFeatures as AudioFeatures).word_timings,
+          }
+        : null;
     setMessage((prev) => (prev.trim() ? `${prev.trim()} ${text}` : text));
   }, []);
   const {
@@ -134,6 +145,7 @@ export default function ConversationSessionPage() {
     error: voiceError,
     startVoice,
     stopVoice,
+    getLastAudioFeatures,
   } = useLiveKitVoice(fetchVoiceToken, onTranscript);
 
   React.useEffect(() => {
@@ -210,20 +222,34 @@ export default function ConversationSessionPage() {
     setError(null);
     setIsSending(true);
     const text = message.trim();
+    // Consume pending audio features from the voice agent (set by onTranscript).
+    // getLastAudioFeatures() clears the ref so a second text send doesn't re-use them.
+    const audioFeatures = pendingAudioFeaturesRef.current ?? getLastAudioFeatures();
+    pendingAudioFeaturesRef.current = null;
+    const isAudioTurn = audioFeatures !== null;
     setMessage("");
     setTurns((prev) => [
       ...(prev ?? []),
       {
         role: "user",
         content: text,
-        input_mode: "text",
+        input_mode: isAudioTurn ? "audio" : "text",
         correction_chip: null,
         created_at: "",
       },
     ]);
 
     try {
-      const result = await sendConversationMessage(params.sessionId, { text });
+      const payload: Parameters<typeof sendConversationMessage>[1] = { text };
+      if (isAudioTurn && audioFeatures) {
+        payload.input_mode = "audio";
+        payload.audio_features = {
+          transcript: text,
+          duration_seconds: audioFeatures.duration_seconds,
+          word_timings: audioFeatures.word_timings,
+        };
+      }
+      const result = await sendConversationMessage(params.sessionId, payload);
       setTurns((prev) => [
         ...(prev ?? []),
         {

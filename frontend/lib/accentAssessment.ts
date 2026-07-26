@@ -136,3 +136,74 @@ export function submitDispute(data: { assessment_id: string; metric_name: string
     body: JSON.stringify(data),
   });
 }
+
+
+// ── Passage reading + liveness appeal ───────────────────────────────────────
+// Restored during the upstream merge: these bindings were dropped when this file
+// was overwritten, while app/dashboard/accent-assessment/page.tsx still imports
+// them and backend/routers/accent_routes.py still serves the routes.
+
+export interface TargetPassageResponse {
+  passage_id: string;
+  difficulty: string;
+  title: string;
+  text: string;
+  // Always populated by GET /passages (the route mints a liveness prompt token).
+  prompt_token: string;
+}
+
+export interface WeakPoint {
+  issue: string;
+  detail: string;
+}
+
+export interface AccentAssessmentResult {
+  assessment_id: string;
+  passage_id: string;
+  overall_score: number;
+  pronunciation_score: number;
+  stress_score: number;
+  rhythm_score: number;
+  intonation_score: number;
+  clarity_score: number;
+  weak_points: WeakPoint[];
+  exercises: string[];
+  warning?: string | null;
+  model_used?: string;
+  liveness_appeal_available?: boolean;
+  appeal_token?: string | null;
+  appeal_prompt?: string | null;
+}
+
+export interface LivenessAppealResult {
+  appeal_passed: boolean;
+  message: string;
+}
+
+// GET /api/accent-assessment/passages
+export function getTargetPassage() {
+  return api<TargetPassageResponse>("/accent-assessment/passages");
+}
+
+// POST /api/accent-assessment/passages/{passage_id}/assessments  (multipart)
+export function submitPassageAssessment(passageId: string, formData: FormData) {
+  return api<AccentAssessmentResult>(`/accent-assessment/passages/${passageId}/assessments`, {
+    method: "POST",
+    body: formData,
+  });
+}
+
+// POST /api/accent-assessment/appeal  (multipart: appeal_token + audio)
+export function submitLivenessAppeal(appealToken: string, audio: Blob) {
+  const formData = new FormData();
+  formData.append("appeal_token", appealToken);
+  formData.append("audio", audio, "appeal.webm");
+  return api<LivenessAppealResult>("/accent-assessment/appeal", {
+    method: "POST",
+    body: formData,
+  });
+}
+
+// Shared recording-rejection parser — single implementation lives in lib/pronunciation.
+export { rejectionFromError } from "./pronunciation";
+export type { RecordingRejected } from "./pronunciation";

@@ -47,6 +47,9 @@ export interface AccentProgressMatrix {
   message?: string;
   locked?: boolean;
   days_until_unlock?: number | null;
+  /** Server-built lock copy — correct wording whether the wait is days away or the
+   *  Month 3 check-in is simply outstanding. Falls back to the day count if absent. */
+  unlock_message?: string | null;
   baseline_completed_at?: string;
   current_completed_at?: string | null;
   metrics?: AccentMetricRow[];

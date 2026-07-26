@@ -1,5 +1,4 @@
 """
-<<<<<<< HEAD
 Accent Assessment — US-82 (ACC-US-03 Target Accent Selection),
 US-83 (ACC-US-04 Score Dispute), US-84 (ACC-US-05 Profile Staleness).
 

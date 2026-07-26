@@ -108,6 +108,11 @@ model User {
   subDialectPreference   String?
   livenessFlagCount      Int                      @default(0)
   isAccentSuspended      Boolean                  @default(false)
+  codeSwitchWords        CodeSwitchWord[]
+  // PSA-US-05/08: Rewrite vocabulary mastery + spoken script-practice history.
+  rewriteVocab           RewriteVocabWord[]
+  scriptPracticeSessions ScriptPracticeSession[]
+  scriptPracticeHistory  ScriptPracticeHistory[]
 
   // PDG-US-15: lifetime cumulative practice time (seconds) credited via
   // practice_time_service pings, and the milestone-hour thresholds already
@@ -115,7 +120,35 @@ model User {
   lifetimePracticeSeconds Float @default(0)
   unlockedMilestoneHours  Int[] @default([])
 
+  // PDG-US-11: Daily Challenge streak. lastChallengeDate is the LOCAL calendar date
+  // (YYYY-MM-DD, from the session's start time) of the last qualifying completion — stored
+  // as a string so day-boundary math is timezone-honest without a stored offset. streakBadges
+  // holds the day-milestones already awarded (7, 30) so a repeat crossing doesn't re-award.
+  currentStreak     Int      @default(0)
+  longestStreak     Int      @default(0)
+  lastChallengeDate String?
+  streakBadges      Int[]    @default([])
+
   @@map("users")
+}
+
+// CSC-US-01: personalized "common code-switch words" list. One row per (userId, word) —
+// a repeat use UPDATES the row (count++ / lastSeenAt), never appends a duplicate, so the
+// practice tracker shows each trouble-word once with its frequency. Populated from the
+// code_switch flags Workplace Coaching already produces (services/code_switch_tracker.py).
+model CodeSwitchWord {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  word        String // the code-switched (non-English) word, lowercased
+  suggestion  String // English equivalent surfaced to the learner
+  count       Int      @default(1) // times the learner has used this word
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+
+  @@unique([userId, word])
+  @@index([userId, lastSeenAt])
+  @@map("code_switch_words")
 }
 
 // Scenario-Based Learning session --> String (not an enum, unlike CoachingScenario) because admins can add custom
@@ -172,6 +205,81 @@ model VocabularyWordProgress {
   @@index([userId, status])
   @@map("vocabulary_word_progress")
 }
+
+// PSA-US-08 (US-160): advanced vocabulary a rewrite introduced, and whether the
+// learner later uses it naturally. Deliberately a SEPARATE table from
+// VocabularyWordProgress (PDG-US-12) so injected-but-unused words never pollute
+// that feature's Mastered/Learning drill-down. Mastery mirrors the same
+// useCount >= 3 threshold. status: introduced (0 uses) | practicing (1-2) | mastered (3+).
+// Usage is detected by scanning the learner's own existing practice sessions
+// (scenario/coaching) read-only — no writes to other features' code.
+model RewriteVocabWord {
+  id             String    @id @default(cuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  word           String
+  useCount       Int       @default(0)
+  status         String    @default("introduced") // introduced | practicing | mastered
+  needsReview    Boolean   @default(false) // E-02: introduced but still unused -> recommend again
+  introducedFrom String? // short context blurb from the rewrite it came from
+  introducedAt   DateTime  @default(now())
+  lastUsedAt     DateTime?
+
+  @@unique([userId, word])
+  @@index([userId, status])
+  @@map("rewrite_vocab_words")
+}
+
+// PSA-US-05 (US-157): Script Practice Confidence Score. The learner reads a
+// rewrite/script aloud twice — a cold baseline, then again after practicing —
+// and we store both AI-measured confidence scores plus the gain. Confidence
+// comes from the SAME existing audio pipeline (session_scorer.score_audio_session
+// + confidence_engine), so both reads are scored on one yardstick. Isolated
+// table — no writes to any other feature.
+model ScriptPracticeSession {
+  id                 String    @id @default(cuid())
+  userId             String
+  user               User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scriptText         String
+  context            String?
+  status             String    @default("awaiting_baseline") // awaiting_baseline | practicing | completed
+  baselineConfidence Float?
+  baselineTranscript String?
+  baselineDuration   Float?
+  afterConfidence    Float?
+  afterTranscript    String?
+  afterDuration      Float?
+  confidenceGain     Float?
+  createdAt          DateTime  @default(now())
+  completedAt        DateTime?
+
+  @@index([userId, status])
+  @@map("script_practice_sessions")
+}
+
+// PSA-US-05 (US-157) history: one append-only row per successful Final Read
+// evaluation, so re-recording the final read preserves every prior result
+// (the live ScriptPracticeSession only holds the current baseline/after state).
+// Paginated server-side by (userId, createdAt) — never loaded whole.
+model ScriptPracticeHistory {
+  id                 String   @id @default(cuid())
+  userId             String
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionId          String?
+  scriptText         String
+  context            String?
+  baselineConfidence Float
+  afterConfidence    Float
+  confidenceGain     Float
+  baselineMetrics    Json     @default("{}") // {confidence, fluency, vocabulary, pronunciation}
+  afterMetrics       Json     @default("{}")
+  feedback           String?
+  createdAt          DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("script_practice_history")
+}
+
 
 // Admin-authored Scenario-Based Learning scenarios. Merged with the
 // built-in lib/prompts.SBL_SCENARIOS at read time. Publishing is just a DB write —

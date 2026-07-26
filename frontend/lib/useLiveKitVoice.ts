@@ -28,9 +28,18 @@ const STOP_WAIT_MS = 15000;
  * inline in the Conversation session page, generalized for Scenarios/Coaching/Interview
  * Coach to reuse.
  */
+// Full-mode acoustic features the voice_agent attaches to a transcript (word timings +
+// prosody + level). Undefined in transcript mode. Shape mirrors voice_agent/agent.py.
+export interface VoiceFeatures {
+  word_timings?: { word: string; start: number; end: number }[];
+  duration_seconds?: number;
+  avg_db?: number;
+  pitch_range_semitones?: number;
+}
+
 export function useLiveKitVoice(
   fetchToken: () => Promise<VoiceTokenResult>,
-  onTranscript: (text: string) => void,
+  onTranscript: (text: string, features?: VoiceFeatures) => void,
 ) {
   const [isVoiceActive, setIsVoiceActive] = React.useState(false);
   const [isConnectingVoice, setIsConnectingVoice] = React.useState(false);
@@ -100,7 +109,7 @@ export function useLiveKitVoice(
           utteranceInFlightRef.current = false;
           pendingStopResolveRef.current?.();
           if (!text) return;
-          onTranscriptRef.current(text);
+          onTranscriptRef.current(text, data.features as VoiceFeatures | undefined);
           setVoiceStatus("Heard you — review and hit Send.");
         } catch (err) {
           console.error("Failed to parse voice data payload:", err);

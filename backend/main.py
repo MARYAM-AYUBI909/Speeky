@@ -32,7 +32,11 @@ from routers.coaching_routes import router as coaching_router
 from routers.conversation_routes import router as conversation_router
 from routers.interview_coach_routes import router as interview_coach_router
 from routers.pronunciation_routes import router as pronunciation_router
+from routers.pronunciation_coach_routes import router as pronunciation_coach_router
 from routers.accent_routes import router as accent_router
+from routers.accent_assessment_routes import router as accent_assessment_router
+from routers.notification_routes import router as notification_router
+from routers.overuse_routes import router as overuse_router
 from routers.practice_time_routes import router as practice_time_router
 from routers.progress_dashboard_routes import router as progress_dashboard_router
 from routers.accent_progress_routes import router as accent_progress_router
@@ -98,8 +102,16 @@ app.include_router(resume_jd_router, prefix="/api/resume-jd-intake")
 app.include_router(scenario_router, prefix="/api/scenarios")
 app.include_router(progress_dashboard_router, prefix="/api/progress-dashboard")
 app.include_router(accent_progress_router, prefix="/api/accent-progress")
+# Ordering matters on the shared /api/pronunciation-coach prefix: pronunciation_router
+# ends with a catch-all GET "/{session_id}", which would swallow the literal paths below
+# (/trouble-words, /pending-outcomes, /accessibility-profile) if it were matched first.
+# Literal-path router goes in first — FastAPI resolves in registration order.
+app.include_router(pronunciation_coach_router, prefix="/api/pronunciation-coach")
 app.include_router(pronunciation_router, prefix="/api/pronunciation-coach")
+app.include_router(accent_assessment_router, prefix="/api/accent-assessment")
 app.include_router(accent_router, prefix="/api/accent-assessment")
+app.include_router(notification_router, prefix="/api/notifications")
+app.include_router(overuse_router, prefix="/api/overuse")
 app.include_router(vocabulary_progress_router, prefix="/api/vocabulary-progress")
 app.include_router(practice_time_router, prefix="/api/practice-time")
 app.include_router(public_speaking_router, prefix="/api/public-speaking")

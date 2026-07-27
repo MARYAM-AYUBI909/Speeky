@@ -135,5 +135,5 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),
-        reload=os.environ.get("NODE_ENV") != "production",
+        reload=os.environ.get("APP_ENV") != "production",
     )

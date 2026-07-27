@@ -102,10 +102,6 @@ app.include_router(resume_jd_router, prefix="/api/resume-jd-intake")
 app.include_router(scenario_router, prefix="/api/scenarios")
 app.include_router(progress_dashboard_router, prefix="/api/progress-dashboard")
 app.include_router(accent_progress_router, prefix="/api/accent-progress")
-# Ordering matters on the shared /api/pronunciation-coach prefix: pronunciation_router
-# ends with a catch-all GET "/{session_id}", which would swallow the literal paths below
-# (/trouble-words, /pending-outcomes, /accessibility-profile) if it were matched first.
-# Literal-path router goes in first — FastAPI resolves in registration order.
 app.include_router(pronunciation_coach_router, prefix="/api/pronunciation-coach")
 app.include_router(pronunciation_router, prefix="/api/pronunciation-coach")
 app.include_router(accent_assessment_router, prefix="/api/accent-assessment")

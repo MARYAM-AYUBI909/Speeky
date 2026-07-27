@@ -15,7 +15,6 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
-from routers.voice_consent_routes import router as voice_consent_router
 
 from lib.prisma_client import db
 from middlewares.error_handler import (
@@ -88,7 +87,6 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 async def health():
     return HTMLResponse("<h1>Speeky API is running!</h1>")
 
-app.include_router(voice_consent_router, prefix="/api/voice-consent")
 app.include_router(auth_router, prefix="/api/auth")
 app.include_router(user_router, prefix="/api/users")
 app.include_router(assessment_router, prefix="/api/assessment")

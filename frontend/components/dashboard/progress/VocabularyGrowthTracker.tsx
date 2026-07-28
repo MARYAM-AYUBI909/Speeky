@@ -61,13 +61,25 @@ export function VocabularyGrowthTracker() {
 
   if (!overview) return null;
 
-  const { metrics, vocabulary_growth: growth, vocabulary_history: history } = overview;
+  // TODO(progress-dashboard-overview): the backend's GET /progress-dashboard/overview
+  // is still serving the older ProgressDashboardOverview.tsx response shape and doesn't
+  // populate metrics/vocabulary_growth/vocabulary_history yet, so these come back
+  // undefined for now — default defensively instead of crashing until that endpoint
+  // is built out for this component.
+  const metrics = overview.metrics;
+  const growth = overview.vocabulary_growth ?? {
+    is_zero_growth: true,
+    message: "Vocabulary growth data isn't available yet.",
+    new_words_count: 0,
+    new_words: [],
+  };
+  const history = overview.vocabulary_history ?? [];
 
   const tiles: MetricTile[] = [
-    { id: "time", label: "Practice Time", value: formatPracticeTime(metrics.practice_time_minutes), icon: Clock },
-    { id: "confidence", label: "Confidence", value: formatScore(metrics.confidence_score), icon: Gauge },
-    { id: "fluency", label: "Fluency", value: formatScore(metrics.fluency_score), icon: TrendingUp },
-    { id: "vocabulary", label: "Vocabulary", value: formatScore(metrics.vocabulary_score), icon: BookOpen },
+    { id: "time", label: "Practice Time", value: formatPracticeTime(metrics?.practice_time_minutes ?? 0), icon: Clock },
+    { id: "confidence", label: "Confidence", value: formatScore(metrics?.confidence_score ?? null), icon: Gauge },
+    { id: "fluency", label: "Fluency", value: formatScore(metrics?.fluency_score ?? null), icon: TrendingUp },
+    { id: "vocabulary", label: "Vocabulary", value: formatScore(metrics?.vocabulary_score ?? null), icon: BookOpen },
   ];
 
   return (

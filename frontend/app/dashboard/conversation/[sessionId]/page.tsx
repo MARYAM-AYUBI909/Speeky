@@ -12,6 +12,8 @@ import {
   Volume2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { AiCoachAvatar } from "@/components/common/AiCoachAvatar";
+import { UserChatAvatar } from "@/components/common/UserChatAvatar";
 import { useVoiceReadinessGate } from "@/components/common/VoiceReadinessGate";
 import { cn } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
@@ -490,51 +492,62 @@ export default function ConversationSessionPage() {
             <div
               key={i}
               className={
-                turn.role === "user" ? "ml-auto max-w-[80%]" : "max-w-[80%]"
+                turn.role === "user"
+                  ? "ml-auto flex max-w-[86%] items-start gap-2"
+                  : "flex max-w-[86%] items-start gap-2"
               }
             >
-              <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                {turn.role === "user" ? "You" : "Coach"}
-              </span>
-              <div
-                className={
-                  turn.role === "user"
-                    ? "rounded-xl rounded-tr-sm bg-primary px-4 py-3 text-sm text-primary-foreground"
-                    : "flex items-start gap-2 rounded-xl rounded-tl-sm bg-secondary px-4 py-3 text-sm text-secondary-foreground"
-                }
-              >
-                <span className="flex-1">{turn.content}</span>
-                {turn.role === "assistant" ? (
-                  <button
-                    type="button"
-                    onClick={() => void handlePlay(i, turn.content)}
-                    disabled={playingIndex === i}
-                    aria-label="Play audio"
-                    className="shrink-0 text-primary hover:opacity-70 disabled:animate-pulse"
-                  >
-                    <Volume2 className="h-4 w-4" aria-hidden="true" />
-                  </button>
+              {turn.role === "assistant" ? <AiCoachAvatar className="mt-5" /> : null}
+              <div className="min-w-0 flex-1">
+                <span
+                  className={cn(
+                    "mb-1 block text-xs font-semibold uppercase tracking-wide text-muted-foreground",
+                    turn.role === "user" && "text-right",
+                  )}
+                >
+                  {turn.role === "user" ? "You" : "Coach"}
+                </span>
+                <div
+                  className={
+                    turn.role === "user"
+                      ? "rounded-xl rounded-tr-sm bg-primary px-4 py-3 text-sm text-primary-foreground"
+                      : "flex items-start gap-2 rounded-xl rounded-tl-sm bg-secondary px-4 py-3 text-sm text-secondary-foreground"
+                  }
+                >
+                  <span className="flex-1">{turn.content}</span>
+                  {turn.role === "assistant" ? (
+                    <button
+                      type="button"
+                      onClick={() => void handlePlay(i, turn.content)}
+                      disabled={playingIndex === i}
+                      aria-label="Play audio"
+                      className="shrink-0 text-primary hover:opacity-70 disabled:animate-pulse"
+                    >
+                      <Volume2 className="h-4 w-4" aria-hidden="true" />
+                    </button>
+                  ) : null}
+                </div>
+                {turn.correction_chip ? (
+                  <div className="mt-1.5 rounded-lg bg-warning/10 px-3 py-2 text-xs text-foreground">
+                    <span className="line-through opacity-70">
+                      {turn.correction_chip.original}
+                    </span>{" "}
+                    <span className="font-medium text-success">
+                      {turn.correction_chip.corrected}
+                    </span>
+                    <p className="mt-0.5 text-muted-foreground">
+                      {turn.correction_chip.explanation}
+                    </p>
+                  </div>
+                ) : null}
+                {turn.role === "user" && turn.input_mode === "audio" ? (
+                  <PronunciationBreakdown
+                    sessionId={params.sessionId}
+                    turnIndex={i}
+                  />
                 ) : null}
               </div>
-              {turn.correction_chip ? (
-                <div className="mt-1.5 rounded-lg bg-warning/10 px-3 py-2 text-xs text-foreground">
-                  <span className="line-through opacity-70">
-                    {turn.correction_chip.original}
-                  </span>{" "}
-                  <span className="font-medium text-success">
-                    {turn.correction_chip.corrected}
-                  </span>
-                  <p className="mt-0.5 text-muted-foreground">
-                    {turn.correction_chip.explanation}
-                  </p>
-                </div>
-              ) : null}
-              {turn.role === "user" && turn.input_mode === "audio" ? (
-                <PronunciationBreakdown
-                  sessionId={params.sessionId}
-                  turnIndex={i}
-                />
-              ) : null}
+              {turn.role === "user" ? <UserChatAvatar className="mt-5" /> : null}
             </div>
           ))}
         </div>
@@ -568,6 +581,7 @@ export default function ConversationSessionPage() {
             <Button
               size="md"
               variant="outline"
+              className="voice-listening-button"
               loading={isStoppingVoice}
               onClick={() => void handleStopVoice()}
             >

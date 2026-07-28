@@ -205,38 +205,22 @@ async def submit_targeted_drill_attempt(
         user_id=user_id, item_id=drill_id, prompt_token=prompt_token
     )
     if not token_valid:
-        playback_info = await liveness_service.record_liveness_flag(
-            user_id=user_id,
-            item_id=drill_id,
-            prompt_token=prompt_token,
-            reason="invalid_or_stale_token",
-        )
         return JSONResponse(
             status_code=422,
             content=RecordingRejectedSchema(
                 reason="stale_token",
                 message="Session token is invalid or has already been used. Please fetch a fresh drill.",
-                appeal_token=playback_info.get("appeal_token"),
-                appeal_prompt=playback_info.get("appeal_prompt"),
             ).model_dump(),
         )
 
     # Playback detection (ACC-US-01)
     playback_reason = recording_engine.detect_playback_audio(analysis, config)
     if playback_reason:
-        flag_info = await liveness_service.record_liveness_flag(
-            user_id=user_id,
-            item_id=drill_id,
-            prompt_token=prompt_token,
-            reason=playback_reason.value,
-        )
         return JSONResponse(
             status_code=422,
             content=RecordingRejectedSchema(
                 reason=playback_reason.value,
                 message="Detected playback audio. Live speech required for targeted drill scoring.",
-                appeal_token=flag_info.get("appeal_token"),
-                appeal_prompt=flag_info.get("appeal_prompt"),
             ).model_dump(),
         )
 

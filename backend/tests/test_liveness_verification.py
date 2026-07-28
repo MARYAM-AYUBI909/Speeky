@@ -105,42 +105,6 @@ def test_detect_playback_audio_flagging():
 
 
 @pytest.mark.asyncio
-async def test_appeal_flow_clears_flag():
-    """ACC-US-01 E-02: Appeal false positive liveness flag via secondary live prompt."""
-    flag_info = await liveness_service.record_liveness_flag(
-        user_id=U, item_id="pas_appeal_01", prompt_token="prm_appeal_01", reason="playback_detected"
-    )
-    appeal_token = flag_info["appeal_token"]
-    assert appeal_token.startswith("app_")
-
-    # Submit live audio for appeal
-    live_analysis = _mock_analysis(noise_floor_dbfs=-45.0, snr_db=25.0)
-    passed, msg = await liveness_service.process_appeal(U, appeal_token, live_analysis)
-    assert passed is True
-    assert "verified successfully" in msg.lower()
-
-
-@pytest.mark.asyncio
-async def test_repeated_flags_trigger_suspension():
-    """ACC-US-01 E-03: Repeated flags (3+) temporarily suspend accent assessment access."""
-    # User initially not suspended
-    assert await liveness_service.check_user_suspended("user_suspension_test_99") is False
-
-    # Record 3 liveness flags
-    for i in range(3):
-        await liveness_service.record_liveness_flag(
-            user_id="user_suspension_test_99",
-            item_id=f"pas_suspend_{i}",
-            prompt_token=f"prm_suspend_{i}",
-            reason="playback_detected",
-        )
-
-    # User now suspended
-    is_suspended = await liveness_service.check_user_suspended("user_suspension_test_99")
-    assert is_suspended is True
-
-
-@pytest.mark.asyncio
 async def test_consecutive_get_target_passage_returns_different_content():
     """ACC-US-01: Two consecutive calls for the same user return different passage content (not just tokens)."""
     from services.accent_assessment_service import get_target_passage

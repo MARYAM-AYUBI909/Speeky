@@ -103,7 +103,7 @@ export function VocabularyGrowthTracker() {
           <p className="text-sm text-muted-foreground">
             Your vocabulary journey starts here. {growth.message}
           </p>
-          
+          <a
             href="/dashboard/explore"
             className="mt-2 text-sm font-medium text-primary hover:underline"
           >

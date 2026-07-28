@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { toast } from "react-toastify";
 import {
   CheckCircle2,
@@ -27,6 +27,8 @@ import {
   scoreConversationTurn,
   type SentenceScoreResult,
 } from "@/lib/pronunciationCoach";
+import { localDate } from "@/lib/dailyChallenge";
+import { getChallengeConversationStatus } from "@/lib/daily-challenge";
 import { ScoreDisputeButton } from "@/components/dashboard/ScoreDisputeButton";
 import { playText, stopCurrent } from "@/lib/tts";
 import { useAutoScroll } from "@/lib/useAutoScroll";
@@ -118,9 +120,13 @@ function PronunciationBreakdown({
   );
 }
 
+const DAILY_CHALLENGE_POLL_MS = 15_000;
+
 export default function ConversationSessionPage() {
   const params = useParams<{ sessionId: string }>();
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const isDailyChallenge = searchParams.get("daily") === "1";
   const [turns, setTurns] = React.useState<ConversationTurn[] | null>(null);
   const [topicLabel, setTopicLabel] = React.useState("");
   const [message, setMessage] = React.useState("");
@@ -239,6 +245,43 @@ export default function ConversationSessionPage() {
   React.useEffect(() => {
     if (voiceError) setError(voiceError);
   }, [voiceError]);
+
+  // PDG-US-11: this session was started via the Daily Challenge redirect. The 5-minute
+  // timer runs server-side off the first prompt, so poll rather than compute it
+  // client-side — that way it still completes (and the user still gets the alert) even
+  // if they go quiet after one message instead of sending another.
+  const [challengeDone, setChallengeDone] = React.useState(false);
+  React.useEffect(() => {
+    if (!isDailyChallenge || challengeDone) return;
+
+    let cancelled = false;
+    async function poll() {
+      try {
+        const res = await getChallengeConversationStatus(params.sessionId, localDate());
+        if (cancelled) return;
+        if (res.status === "qualified") {
+          setChallengeDone(true);
+          if (res.just_completed) {
+            toast.success(
+              `🔥 Daily Challenge complete — ${res.current_streak}-day streak!${
+                res.milestone_message ? ` ${res.milestone_message}` : ""
+              }`,
+            );
+            window.dispatchEvent(new CustomEvent("speeky:streak-updated"));
+          }
+        }
+      } catch {
+        // Best-effort — a poll failure just tries again next tick.
+      }
+    }
+
+    void poll();
+    const interval = window.setInterval(poll, DAILY_CHALLENGE_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [isDailyChallenge, challengeDone, params.sessionId]);
 
   async function handleStartVoice() {
     setError(null);

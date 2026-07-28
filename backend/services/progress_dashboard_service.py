@@ -41,6 +41,10 @@ MAX_DAILY_VOCAB_GROWTH = 15
 DAY1_MOTIVATIONAL_PROMPT = "Complete your first session to see your progress growth!"
 SYNC_STALE_MESSAGE = "Syncing recent data... Unable to reach server, showing last-known-good metrics."
 
+# PDG-US-14 copy used by the legacy /overview payload (Vocabulary Growth panel).
+_EMPTY_STATE_MESSAGE = "Complete a Scenario to start collecting words!"
+_ZERO_GROWTH_MESSAGE = "Great consistency! Try a new Scenario to discover advanced words."
+
 
 async def _is_db_connected() -> bool:
     try:
@@ -88,51 +92,28 @@ async def _flag_outlier_row(prisma_model, row_id: str, flag_field: str, offendin
         logger.warning(f"Failed to persist outlier flag ({flag_field}) on row {row_id}: {e}")
 
 
-def calculate_rolling_streak(records: List[Dict]) -> int:
+async def get_daily_streak_days(user_id: str) -> int:
+    """The learner's Daily Challenge streak — read from the ONE source of truth.
+
+    PDG-US-11 owns streaks (services/daily_challenge_service, kv-backed qualified_dates)
+    and the Daily Challenge card / navbar icon render that number. This dashboard used to
+    derive its own streak from a rolling 24-48h window over session rows, which answered a
+    different question and showed the user a different number for the same word on the
+    same screen. Reading the canonical value keeps the platform consistent.
+
+    Best-effort: a streak lookup failure must never take down the whole dashboard.
     """
-    E-04 Streak Calculation:
-    Calculates practice streak using a rolling 24-48 hour UTC window rather than strict
-    local calendar-day boundaries, so travel / timezone shifts don't break a real streak.
-    """
-    if not records:
+    try:
+        from services import daily_challenge_service
+
+        raw = await daily_challenge_service._get_streak_raw(user_id)
+        _completed_today, alive_streak = daily_challenge_service._streak_view(
+            raw, datetime.now(timezone.utc).date()
+        )
+        return alive_streak
+    except Exception as e:
+        logger.warning(f"Daily streak lookup failed: {e}")
         return 0
-
-    timestamps = [r["completed_at"] for r in records if r.get("completed_at") is not None]
-    if not timestamps:
-        return 0
-
-    timestamps.sort()
-    now = datetime.now(timezone.utc)
-    latest = timestamps[-1]
-
-    if latest.tzinfo is None:
-        latest = latest.replace(tzinfo=timezone.utc)
-
-    # If user hasn't practiced in the last 48 hours, current streak is 0
-    time_since_latest = (now - latest).total_seconds()
-    if time_since_latest > 48 * 3600:
-        return 0
-
-    streak = 1
-    current_anchor = latest
-
-    for t in reversed(timestamps[:-1]):
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
-
-        gap_seconds = (current_anchor - t).total_seconds()
-        # Intra-day sessions (gap <= 4h) count as same activity block
-        if gap_seconds <= 4 * 3600:
-            continue
-        # Consecutive activity within 48h rolling window increments streak
-        elif gap_seconds <= 48 * 3600:
-            streak += 1
-            current_anchor = t
-        else:
-            # Gap > 48h breaks streak
-            break
-
-    return streak
 
 
 async def _fetch_completed_records_from_db(user_id: str) -> Tuple[List[Dict], int]:
@@ -275,28 +256,53 @@ async def _fetch_completed_records_from_db(user_id: str) -> Tuple[List[Dict], in
     return records, outliers_count
 
 
-async def _fetch_vocab_growth_count(user_id: str) -> int:
-    """Fetch vocabulary growth count from ScenarioSession."""
+async def _vocabulary_growth_detail(user_id: str) -> Dict:
+    """Vocabulary growth from ScenarioSession, with the words and the PDG-US-14
+    empty/zero-growth messaging the legacy overview payload renders.
+
+    Single implementation — _fetch_vocab_growth_count is just the count view of this,
+    so the "new words since last session" rule lives in exactly one place.
+    """
+    empty = {
+        "new_words_count": 0,
+        "new_words": [],
+        "is_empty_state": True,
+        "is_zero_growth": False,
+        "message": _EMPTY_STATE_MESSAGE,
+    }
     if not await _is_db_connected():
-        return 0
+        return empty
 
     try:
         sessions = await db.scenariosession.find_many(
             where={"userId": user_id, "completedAt": {"not": None}}, order={"completedAt": "asc"}
         )
         if not sessions:
-            return 0
+            return empty
 
         seen: set = set()
         for session in sessions[:-1]:
             seen.update(session.vocabUsed or [])
 
-        latest_vocab = set(sessions[-1].vocabUsed or [])
-        new_words = latest_vocab - seen
-        return min(len(new_words), MAX_DAILY_VOCAB_GROWTH)
+        latest_new_words = sorted(set(sessions[-1].vocabUsed or []) - seen)
+        # E-03: cap so a scoring anomaly can't skew the chart.
+        new_words_count = min(len(latest_new_words), MAX_DAILY_VOCAB_GROWTH)
+        is_zero_growth = new_words_count == 0
+        return {
+            "new_words_count": new_words_count,
+            "new_words": latest_new_words[:MAX_DAILY_VOCAB_GROWTH],
+            "is_empty_state": False,
+            "is_zero_growth": is_zero_growth,
+            "message": _ZERO_GROWTH_MESSAGE if is_zero_growth else None,
+        }
     except Exception as e:
         logger.warning(f"Vocab growth query failed: {e}")
-        return 0
+        return empty
+
+
+async def _fetch_vocab_growth_count(user_id: str) -> int:
+    """Fetch vocabulary growth count from ScenarioSession."""
+    return (await _vocabulary_growth_detail(user_id))["new_words_count"]
 
 
 def _build_dashboard_payload(
@@ -307,6 +313,8 @@ def _build_dashboard_payload(
     sync_status: str = "synced",
     is_stale: bool = False,
     sync_message: Optional[str] = None,
+    lifetime_practice_seconds: float = 0.0,
+    daily_streak_days: int = 0,
 ) -> Dict:
     """Constructs the complete ProgressDashboardResponseSchema dict."""
     now_str = datetime.now(timezone.utc).isoformat()
@@ -357,10 +365,16 @@ def _build_dashboard_payload(
     latest_vocab = _latest("vocabulary_score")
     latest_pron = _latest("pronunciation_score")
 
-    total_seconds = sum(r.get("duration_seconds", 0.0) for r in records)
+    # Total practice time comes from the SAME source of truth as the Practice Time
+    # Milestones panel (practice_time_service): the ping-credited lifetime total on the
+    # user, not a sum of per-session wall-clock spans. Summing spans counts idle/menu
+    # time and drifts out of step with the Trophy Case; the ping total already excludes
+    # idle, stale and concurrent-device pings. Per-session spans below are untouched —
+    # they still drive the per-point trend chart.
+    total_seconds = lifetime_practice_seconds
     total_minutes = round(total_seconds / 60.0, 1)
     total_hours = round(total_seconds / 3600.0, 2)
-    streak_days = calculate_rolling_streak(records)
+    streak_days = daily_streak_days
 
     primary_metric = PrimaryMetricSchema(
         name="Confidence Score",
@@ -448,7 +462,16 @@ async def get_progress_dashboard(user_id: str = Depends(require_auth)) -> Dict:
             db_records, outliers_count = await _fetch_completed_records_from_db(user_id)
 
         vocab_growth = await _fetch_vocab_growth_count(user_id)
-        payload = _build_dashboard_payload(user_id, db_records, outliers_count, vocab_growth)
+        # Single source of truth for practice time — see _build_dashboard_payload.
+        dashboard_user = await db.user.find_unique(where={"id": user_id})
+        payload = _build_dashboard_payload(
+            user_id,
+            db_records,
+            outliers_count,
+            vocab_growth,
+            lifetime_practice_seconds=(dashboard_user.lifetimePracticeSeconds if dashboard_user else 0.0),
+            daily_streak_days=await get_daily_streak_days(user_id),
+        )
 
         # E-01: Save last-known-good snapshot to KV store. create() fails with a
         # unique-constraint violation once a snapshot row already exists for this
@@ -483,11 +506,50 @@ async def get_progress_dashboard(user_id: str = Depends(require_auth)) -> Dict:
 
 
 async def get_overview(user_id: str = Depends(require_auth)):
-    """Backwards-compatible endpoint for existing UI / tests."""
+    """Backwards-compatible endpoint for existing UI / tests.
+
+    Returns the flat legacy shape the Vocabulary Growth panel reads
+    (has_data / metrics / vocabulary_growth / vocabulary_history). The richer
+    time-series payload lives on /progress and /track via get_progress_dashboard —
+    this deliberately does NOT delegate to it, because that response has a different
+    schema and would break the existing panel.
+    """
     from services.gating_service import GatedFeature, check_feature_access
 
     access = await check_feature_access(user_id, GatedFeature.PROGRESS_DASHBOARD.value)
     if not access["accessible"]:
         return JSONResponse(status_code=403, content={"error": access["reason"], "gating": access})
 
-    return await get_progress_dashboard(user_id)
+    records, _outliers = await _fetch_completed_records_from_db(user_id)
+    records.sort(key=lambda r: r["completed_at"])
+    growth = await _vocabulary_growth_detail(user_id)
+
+    # Same single source of truth for practice time as the Milestones panel.
+    user = await db.user.find_unique(where={"id": user_id})
+    practice_time_minutes = round((user.lifetimePracticeSeconds if user else 0.0) / 60, 1)
+
+    def _latest(key: str) -> Optional[float]:
+        for record in reversed(records):
+            value = record.get(key)
+            if value is not None:
+                return round(value, 2)
+        return None
+
+    vocabulary_history = [
+        {"date": r["completed_at"].isoformat(), "vocabulary_score": round(r["vocabulary_score"], 2)}
+        for r in records
+        if r.get("vocabulary_score") is not None
+    ][-20:]  # cap chart payload to the most recent 20 points
+
+    return {
+        "has_data": bool(records),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "metrics": {
+            "practice_time_minutes": practice_time_minutes,
+            "confidence_score": _latest("confidence_score"),
+            "fluency_score": _latest("fluency_score"),
+            "vocabulary_score": _latest("vocabulary_score"),
+        },
+        "vocabulary_growth": growth,
+        "vocabulary_history": vocabulary_history,
+    }

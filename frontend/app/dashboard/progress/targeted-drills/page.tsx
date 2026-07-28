@@ -14,6 +14,7 @@ import {
   SkipForward,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useVoiceReadinessGate } from "@/components/common/VoiceReadinessGate";
 import { cn } from "@/lib/utils";
 import {
   getTargetedDrills,
@@ -39,6 +40,9 @@ export default function TargetedDrillsPage() {
 
   const mediaRecorderRef = React.useRef<MediaRecorder | null>(null);
   const audioChunksRef = React.useRef<Blob[]>([]);
+  const { gate, runWithVoiceReadiness } = useVoiceReadinessGate({
+    featureName: "targeted drills",
+  });
 
   const loadDrills = React.useCallback(async () => {
     setIsLoading(true);
@@ -145,7 +149,7 @@ export default function TargetedDrillsPage() {
         <span className="flex h-12 w-12 items-center justify-center rounded-full bg-secondary text-primary">
           <Lock className="h-6 w-6" />
         </span>
-        <h1 className="font-serif text-2xl font-semibold text-foreground">
+        <h1 className="font-serif text-h2 font-semibold text-foreground">
           Targeted Exercises Locked
         </h1>
         <p className="text-sm text-muted-foreground">
@@ -162,6 +166,7 @@ export default function TargetedDrillsPage() {
 
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-6">
+      {gate}
       <div className="flex items-center justify-between">
         <Link href="/dashboard/progress">
           <Button variant="ghost" size="sm" className="gap-1.5">
@@ -174,7 +179,7 @@ export default function TargetedDrillsPage() {
       </div>
 
       <div className="flex flex-col gap-1">
-        <h1 className="font-serif text-3xl font-semibold tracking-tight text-foreground">
+        <h1 className="font-serif text-h1 font-semibold text-foreground">
           Targeted Accent Exercises
         </h1>
         <p className="text-sm text-muted-foreground">
@@ -227,7 +232,7 @@ export default function TargetedDrillsPage() {
           {/* Record Button */}
           <div className="mt-4 flex flex-col items-center gap-3">
             <button
-              onClick={isRecording ? handleStopRecording : handleStartRecording}
+              onClick={isRecording ? handleStopRecording : () => void runWithVoiceReadiness(handleStartRecording)}
               disabled={isSubmitting}
               className={cn(
                 "flex h-20 w-20 items-center justify-center rounded-full transition-all shadow-md",

@@ -9,6 +9,9 @@ import { PrivacyConsentSection } from "@/components/dashboard/profile/PrivacyCon
 import { NotificationPreferencesSection } from "@/components/dashboard/profile/NotificationPreferencesSection";
 import { ConversationMemorySection } from "@/components/dashboard/profile/ConversationMemorySection";
 import { CodeSwitchSection } from "@/components/dashboard/profile/CodeSwitchSection";
+import { CodeSwitchWordListSection } from "@/components/dashboard/profile/CodeSwitchWordListSection";
+import { TargetAccentSection } from "@/components/dashboard/profile/TargetAccentSection";
+import { AccessibilityProfileSection } from "@/components/dashboard/profile/AccessibilityProfileSection";
 import { SecuritySection } from "@/components/dashboard/profile/SecuritySection";
 import { DangerZoneSection } from "@/components/dashboard/profile/DangerZoneSection";
 
@@ -21,7 +24,7 @@ export default function ProfilePage() {
 
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-6">
-      <h1 className="font-serif text-3xl font-semibold tracking-tight text-foreground">
+      <h1 className="font-serif text-h1 font-semibold text-foreground">
         Profile
       </h1>
 
@@ -33,7 +36,10 @@ export default function ProfilePage() {
       <PrivacyConsentSection />
       <NotificationPreferencesSection />
       <ConversationMemorySection />
+      <TargetAccentSection />
+      <AccessibilityProfileSection />
       <CodeSwitchSection />
+      <CodeSwitchWordListSection />
       <SecuritySection />
       <DangerZoneSection />
     </div>

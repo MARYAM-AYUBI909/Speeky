@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { toast } from "react-toastify";
 import { FlaskConical, Pencil, Plus, ShieldAlert, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -204,6 +205,7 @@ export default function AdminScenariosPage() {
       }
       setModalOpen(false);
       refresh();
+      toast.success(editingId ? "Scenario updated." : "Scenario created.");
     } catch (err) {
       setFormError(
         err instanceof ApiError ? err.message : "Couldn't save this scenario.",
@@ -219,8 +221,9 @@ export default function AdminScenariosPage() {
     try {
       await adminDeleteCustomScenario(scenario.id);
       refresh();
+      toast.success("Scenario deleted.");
     } catch (err) {
-      setError(
+      toast.error(
         err instanceof ApiError
           ? err.message
           : "Couldn't delete this scenario.",
@@ -243,7 +246,7 @@ export default function AdminScenariosPage() {
     <div className="flex flex-col gap-8">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="font-serif text-3xl font-semibold tracking-tight text-foreground">
+          <h1 className="font-serif text-h1 font-semibold text-foreground">
             Custom Scenarios
           </h1>
           <p className="mt-2 max-w-xl text-sm text-muted-foreground">

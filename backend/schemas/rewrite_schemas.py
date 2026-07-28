@@ -17,6 +17,8 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
+from schemas.limits import MAX_SHORT_TEXT_CHARS, MAX_UTTERANCE_CHARS
+
 
 class DifficultyLevel(str, Enum):
     """The four learner-facing rewrite tiers from PSA-US-06.
@@ -34,14 +36,31 @@ class DifficultyLevel(str, Enum):
 
 # ── US-158: Personalized Rewrite Difficulty ───────────────────────────────────
 class GenerateRewriteRequest(BaseModel):
-    original: str = Field(..., min_length=1, description="The learner's own wording to improve")
+    original: str = Field(..., min_length=1, max_length=MAX_UTTERANCE_CHARS,
+                          description="The learner's own wording to improve")
     context: Optional[str] = Field(
-        None, description="Optional situation hint, e.g. 'HR interview answer' or 'client email'"
+        None, max_length=MAX_SHORT_TEXT_CHARS,
+        description="Optional situation hint, e.g. 'HR interview answer' or 'client email'"
     )
     # None => auto-detect from the learner's assessed level (E-01 defaults to intermediate).
     difficulty: Optional[DifficultyLevel] = Field(
         None, description="Manual override; omit to personalize from the learner's level"
     )
+
+
+# ── US-161: Rewrite Reliability & Quality Validation ──────────────────────────
+class ValidationResult(BaseModel):
+    """Outcome of the quality gate that every generated rewrite passes through.
+
+    checks maps each dimension (fact_preservation, tone_consistency,
+    professional_vocabulary, readability, no_hallucination, context_preservation)
+    to pass/fail. `validated=False` means the gate was skipped (LLM unavailable),
+    not that it failed."""
+
+    passed: bool
+    validated: bool
+    checks: dict = Field(default_factory=dict)
+    issues: List[str] = Field(default_factory=list)
 
 
 class GenerateRewriteResponse(BaseModel):
@@ -50,6 +69,17 @@ class GenerateRewriteResponse(BaseModel):
     difficulty_used: DifficultyLevel
     auto_detected: bool  # True when difficulty was resolved from the learner's stored level
     generated_by: str    # "llm" | "offline"
+    # US-161: quality gate result + how many generations it took to pass.
+    validation: Optional[ValidationResult] = None
+    attempts: int = 1
+
+
+class ValidateRewriteRequest(BaseModel):
+    original: str = Field(..., min_length=1, max_length=MAX_UTTERANCE_CHARS)
+    rewrite: str = Field(..., min_length=1, max_length=MAX_UTTERANCE_CHARS)
+    difficulty: Optional[DifficultyLevel] = Field(
+        None, description="Optional level, so vocabulary-complexity is judged against the right tier"
+    )
 
 
 # ── US-156: Rewrite Improvement Score ─────────────────────────────────────────
@@ -60,8 +90,8 @@ class DimensionScore(BaseModel):
 
 
 class ScoreRewriteRequest(BaseModel):
-    original: str = Field(..., min_length=1)
-    rewrite: str = Field(..., min_length=1)
+    original: str = Field(..., min_length=1, max_length=MAX_UTTERANCE_CHARS)
+    rewrite: str = Field(..., min_length=1, max_length=MAX_UTTERANCE_CHARS)
 
 
 class ScoreRewriteResponse(BaseModel):
@@ -82,8 +112,8 @@ class ChangeExplanation(BaseModel):
 
 
 class ExplainRewriteRequest(BaseModel):
-    original: str = Field(..., min_length=1)
-    rewrite: str = Field(..., min_length=1)
+    original: str = Field(..., min_length=1, max_length=MAX_UTTERANCE_CHARS)
+    rewrite: str = Field(..., min_length=1, max_length=MAX_UTTERANCE_CHARS)
 
 
 class ExplainRewriteResponse(BaseModel):

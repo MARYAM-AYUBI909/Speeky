@@ -114,10 +114,19 @@ async def start_session(
     user_id: str,
     request: StartPublicSpeakingSchema,
 ) -> Dict:
+    """Start a new public speaking session"""
+    # A fresh start supersedes any other open Public Speaking session this user
+    # has running — mirrors pronunciation_coach_service._start_session's guard.
+    await db.publicspeakingsession.update_many(
+        where={"userId": user_id, "status": {"in": ["in_progress", "qa_phase"]}},
+        data={"status": "abandoned"},
+    )
+
     session_id = str(uuid.uuid4())
-    
+
     speech_config = SPEECH_TYPES.get(request.speech_type, SPEECH_TYPES["business_pitch"])
-    
+
+    # Create session record
     session = await db.publicspeakingsession.create(
         data={
             "id": session_id,
@@ -139,6 +148,26 @@ async def start_session(
         "ideal_wpm_range": speech_config["ideal_wpm_range"],
         "topic": request.topic,
         "status": "in_progress",
+    }
+
+
+async def find_resumable_session(user_id: str) -> Dict:
+    """Mirrors pronunciation_coach_service._find_resumable_session's shape —
+    used by the Public Speaking landing page to offer Resume before showing the
+    normal speech-type picker."""
+    row = await db.publicspeakingsession.find_first(
+        where={"userId": user_id, "status": {"in": ["in_progress", "qa_phase"]}},
+        order={"createdAt": "desc"},
+    )
+    # Engagement gate: "in_progress" with no transcript yet means the learner landed
+    # on the page and hasn't actually delivered anything — reaching "qa_phase" (or
+    # having a transcript at all) is the real signal something's worth resuming.
+    if not row or (row.status == "in_progress" and row.transcript is None):
+        return {"found": False}
+    speech_config = SPEECH_TYPES.get(row.speechType, SPEECH_TYPES["business_pitch"])
+    return {
+        "found": True, "session_id": row.id, "speech_type": row.speechType,
+        "label": speech_config["label"], "started_at": row.createdAt.isoformat(),
     }
 
 

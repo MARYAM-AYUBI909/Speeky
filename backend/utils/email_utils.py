@@ -165,21 +165,15 @@ async def _send_email(to: str, subject: str, heading: str, body_html: str, text_
     msg.set_content(text_body)
     msg.add_alternative(_render_template(heading, body_html), subtype="html")
 
-    try:
-        await aiosmtplib.send(
-            msg,
-            hostname=cfg["hostname"],
-            port=cfg["port"],
-            username=cfg["username"],
-            password=cfg["password"],
-            use_tls=cfg["use_tls"],
-            start_tls=cfg["start_tls"],
-        )
-    except Exception as e:
-        # No working SMTP relay configured (e.g. local dev with placeholder
-        # SMTP_USER/SMTP_PASS) — log instead of crashing the request. text_body
-        # carries the OTP/reset link, so it's still usable from the console.
-        print(f"[email_utils] Failed to send '{subject}' to {to}: {e!r}\n--- email content ---\n{text_body}\n---")
+    await aiosmtplib.send(
+        msg,
+        hostname=cfg["hostname"],
+        port=cfg["port"],
+        username=cfg["username"],
+        password=cfg["password"],
+        use_tls=cfg["use_tls"],
+        start_tls=cfg["start_tls"],
+    )
 
 
 async def send_otp_email(to: str, code: str) -> None:

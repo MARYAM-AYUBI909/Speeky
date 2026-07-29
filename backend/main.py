@@ -25,6 +25,7 @@ from middlewares.error_handler import (
     validation_error_handler,
 )
 from routers.accent_progress_routes import router as accent_progress_router
+from routers.active_session_routes import router as active_session_router
 from routers.analytics_routes import router as analytics_router
 from routers.auth_routes import router as auth_router
 from routers.category_routes import router as category_router
@@ -75,15 +76,8 @@ app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    # allow_credentials=True forbids a wildcard origin (browsers reject
-    # "Access-Control-Allow-Origin: *" on credentialed requests) — must be an
-    # explicit list. Covers both common local dev ports (Next.js 3000, Vite
-    # 5173) plus whatever CLIENT_ORIGIN is set to in production.
-    allow_origins=list({
-        os.environ.get("CLIENT_ORIGIN", "http://localhost:3000"),
-        "http://localhost:3000",
-        "http://localhost:5173",
-    }),
+    # allow_origins=[os.environ.get("CLIENT_ORIGIN", "http://localhost:3000")],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST","PATCH", "DELETE", "OPTIONS"],
 )
@@ -106,6 +100,7 @@ app.include_router(auth_router, prefix="/api/auth")
 app.include_router(user_router, prefix="/api/users")
 app.include_router(category_router, prefix="/api/categories")
 app.include_router(analytics_router, prefix="/api/analytics")
+app.include_router(active_session_router, prefix="/api/active-sessions")
 app.include_router(assessment_router, prefix="/api/assessment")
 app.include_router(coaching_router, prefix="/api/coaching")
 app.include_router(conversation_router, prefix="/api/conversation")

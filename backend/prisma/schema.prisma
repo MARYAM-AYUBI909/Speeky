@@ -146,13 +146,6 @@ model User {
   // flips it true the first time a user (new or backfilled) actually saves a choice.
   learningGoalSet Boolean @default(false)
 
-  // ENT-US-03: Organization Structure - Team & Department Hierarchy
-  primaryTeamId    String?
-  primaryTeam      Team?                   @relation("PrimaryTeamMembers", fields: [primaryTeamId], references: [id], onDelete: SetNull)
-  secondaryTags    String[]                @default([])
-  managedTeams     Team[]                  @relation("TeamManager")
-  teamHistory      TeamAssignmentHistory[]
-
   @@map("users")
 }
 
@@ -667,41 +660,3 @@ model LivenessFlag {
   @@index([userId, createdAt])
   @@map("liveness_flags")
 }
-
-// ENT-US-03: Department & Team Hierarchy Management
-model Team {
-  id          String    @id @default(cuid())
-  name        String
-  description String?
-  parentId    String?
-  parent      Team?     @relation("TeamHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
-  children    Team[]    @relation("TeamHierarchy")
-  managerId   String?
-  manager     User?     @relation("TeamManager", fields: [managerId], references: [id], onDelete: SetNull)
-  archived    Boolean   @default(false)
-  archivedAt  DateTime?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
-
-  primaryMembers    User[]                  @relation("PrimaryTeamMembers")
-  assignmentHistory TeamAssignmentHistory[]
-
-  @@index([parentId])
-  @@index([managerId])
-  @@map("teams")
-}
-
-model TeamAssignmentHistory {
-  id        String    @id @default(cuid())
-  userId    String
-  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  teamId    String
-  team      Team      @relation(fields: [teamId], references: [id], onDelete: Cascade)
-  startDate DateTime  @default(now())
-  endDate   DateTime?
-
-  @@index([userId, startDate, endDate])
-  @@index([teamId, startDate, endDate])
-  @@map("team_assignment_history")
-}
-

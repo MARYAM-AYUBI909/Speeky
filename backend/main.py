@@ -73,8 +73,15 @@ app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    # allow_origins=[os.environ.get("CLIENT_ORIGIN", "http://localhost:3000")],
-    allow_origins=["*"],
+    # allow_credentials=True forbids a wildcard origin (browsers reject
+    # "Access-Control-Allow-Origin: *" on credentialed requests) — must be an
+    # explicit list. Covers both common local dev ports (Next.js 3000, Vite
+    # 5173) plus whatever CLIENT_ORIGIN is set to in production.
+    allow_origins=list({
+        os.environ.get("CLIENT_ORIGIN", "http://localhost:3000"),
+        "http://localhost:3000",
+        "http://localhost:5173",
+    }),
     allow_credentials=True,
     allow_methods=["GET", "POST","PATCH", "DELETE", "OPTIONS"],
 )

@@ -14,6 +14,7 @@ from services.public_speaking_service import (
     submit_qa_response,
     get_session,
     get_voice_token,
+    get_filler_words_for_session,
 )
 
 router = APIRouter()
@@ -74,4 +75,3 @@ async def api_get_filler_words(
 ):
     """Get filler word breakdown and timeline markers for session (PSC-US-08)"""
     return await get_filler_words_for_session(session_id, user_id)
-

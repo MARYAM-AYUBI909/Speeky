@@ -84,6 +84,25 @@ class PrismaKvStore:
         rows = await db.kventry.find_many(where={"namespace": namespace})
         return [_decode(r.value) for r in rows]
 
+    async def get_all(self, namespace: str) -> Dict[str, Dict]:
+        rows = await db.kventry.find_many(where={"namespace": namespace})
+        return {r.key: _decode(r.value) for r in rows}
+
+    async def delete(self, namespace: str, key: str) -> None:
+        try:
+            await db.kventry.delete(
+                where={"namespace_key": {"namespace": namespace, "key": key}}
+            )
+        except Exception:
+            pass
+
+    async def clear_namespace(self, namespace: str) -> None:
+        try:
+            await db.kventry.delete_many(where={"namespace": namespace})
+        except Exception:
+            pass
+
+
 
 class InMemoryKvStore:
     """In-process store for tests. Mirrors PrismaKvStore's JSON round-trip (datetime
@@ -108,6 +127,20 @@ class InMemoryKvStore:
         return [
             _decode(copy.deepcopy(v)) for (ns, _k), v in self._data.items() if ns == namespace
         ]
+
+    async def get_all(self, namespace: str) -> Dict[str, Dict]:
+        return {
+            k: _decode(copy.deepcopy(v))
+            for (ns, k), v in self._data.items()
+            if ns == namespace
+        }
+
+    async def delete(self, namespace: str, key: str) -> None:
+        self._data.pop((namespace, key), None)
+
+    async def clear_namespace(self, namespace: str) -> None:
+        self._data = {k: v for k, v in self._data.items() if k[0] != namespace}
+
 
 
 # Default persistent store; tests reassign kv_store.store = InMemoryKvStore().

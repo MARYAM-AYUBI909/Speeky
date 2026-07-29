@@ -52,7 +52,9 @@ from routers.code_switch_routes import router as code_switch_router
 from routers.rewrite_routes import router as rewrite_router
 from routers.rewrite_vocab_routes import router as rewrite_vocab_router
 from routers.script_practice_routes import router as script_practice_router
+from routers.team_routes import router as team_router
 from utils.app_error import AppError
+
 
 
 @asynccontextmanager
@@ -127,6 +129,8 @@ app.include_router(code_switch_router, prefix="/api/code-switch")
 app.include_router(rewrite_router, prefix="/api/rewrite")
 app.include_router(rewrite_vocab_router, prefix="/api/rewrite-vocab")
 app.include_router(script_practice_router, prefix="/api/script-practice")
+app.include_router(team_router, prefix="/api/teams")
+
 
 # Local-folder avatar storage, exposed to frontend as static files
 _uploads_dir = os.path.join(os.path.dirname(__file__), "uploads")

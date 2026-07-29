@@ -3,10 +3,13 @@ from fastapi import APIRouter
 from services.user_service import (
     delete_account,
     get_accent_preference,
+    get_learning_goal,
     get_profile,
     list_users,
     set_accent_preference,
+    set_learning_goal,
     request_email_change,
+    transfer_super_admin,
     update_profile,
     update_user_role,
     upload_avatar,
@@ -20,6 +23,9 @@ router = APIRouter()
 router.add_api_route("/me", get_profile, methods=["GET"])
 router.add_api_route("/me", update_profile, methods=["PATCH"])
 router.add_api_route("/me", delete_account, methods=["DELETE"])
+# Learning goal — picked after signup OTP verification (US-08), editable later (US-10)
+router.add_api_route("/me/learning-goal", get_learning_goal, methods=["GET"])
+router.add_api_route("/me/learning-goal", set_learning_goal, methods=["PATCH"])
 # Accent Model Preference toggle (ACC-US-11)
 router.add_api_route("/me/accent-preference", get_accent_preference, methods=["GET"])
 router.add_api_route("/me/accent-preference", set_accent_preference, methods=["PATCH"])
@@ -32,6 +38,7 @@ router.add_api_route("/me/email/request-change", request_email_change, methods=[
 router.add_api_route("/me/email/verify-change", verify_email_change, methods=["POST"])
 
 
-# Admin-only (auth + role enforced via Depends(require_admin) on each handler)
+# Super-Admin-only (auth + role enforced via Depends(require_super_admin) on each handler)
 router.add_api_route("/", list_users, methods=["GET"])
 router.add_api_route("/{target_user_id}/role", update_user_role, methods=["PATCH"])
+router.add_api_route("/{target_user_id}/transfer-super-admin", transfer_super_admin, methods=["POST"])

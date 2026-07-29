@@ -22,6 +22,7 @@ import {
   type RetryResult,
   type SessionSummary,
 } from "@/lib/pronunciation";
+import { useActiveSessions } from "@/contexts/ActiveSessionsContext";
 
 type Step =
   | { name: "loading" }
@@ -46,6 +47,7 @@ const NEGATIVE_MESSAGE_KEYS = new Set([
 export default function PronunciationCoachPage() {
   const { access } = useAssessmentAccess();
   const isUnlocked = access?.access_level === "full_access";
+  const { refresh: refreshActiveSessions } = useActiveSessions();
 
   const [step, setStep] = React.useState<Step>({ name: "loading" });
   const [isSubmitting, setIsSubmitting] = React.useState(false);
@@ -127,6 +129,8 @@ export default function PronunciationCoachPage() {
           message: resumed.message,
         },
       });
+      // Sidebar dot reflects resumed (still active) session — refresh to sync.
+      refreshActiveSessions().catch(() => {});
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Couldn't resume that session.");
     } finally {
@@ -141,6 +145,8 @@ export default function PronunciationCoachPage() {
       const session = await startPronunciationSession();
       activeSessionRef.current = { sessionId: session.session_id, completed: false };
       setStep({ name: "practice", session });
+      // Old session superseded — sidebar dot should clear (new session has no attempts yet).
+      refreshActiveSessions().catch(() => {});
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Couldn't start a new session.");
     } finally {

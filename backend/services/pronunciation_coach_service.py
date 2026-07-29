@@ -744,9 +744,13 @@ async def _interrupt_session(user_id: str, session_id: str) -> dict:
 
 
 async def _find_resumable_session(user_id: str) -> dict:
+    # Engagement gate: a session with zero submitted attempts is one the learner
+    # never actually practiced in (auto-started on page load, then abandoned) —
+    # nothing real to resume, so it shouldn't keep re-surfacing the resume prompt
+    # on every later visit.
     sessions = [
         s for s in await kv_store.store.list_values(NAMESPACE)
-        if s["user_id"] == user_id and s["status"] != "completed"
+        if s["user_id"] == user_id and s["status"] != "completed" and s.get("attempts") and not s.get("superseded")
     ]
     if not sessions:
         return {"found": False, "message": INTERRUPTION_MESSAGES["not_found"]}

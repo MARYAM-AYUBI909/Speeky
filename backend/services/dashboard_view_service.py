@@ -147,6 +147,8 @@ async def _find_view_by_name_for_user(
 ) -> Optional[Dict[str, Any]]:
     all_views = await kv_store.store.list_values(DASHBOARD_VIEW_NS)
     for v in all_views:
+        if v.get("_deleted"):
+            continue
         if v.get("user_id") == user_id and v.get("name") == name:
             return v
     return None
@@ -213,7 +215,7 @@ async def get_view(
     E-03: Role-filtered widget resolution applied when viewing a shared view.
     """
     raw = await kv_store.store.get(DASHBOARD_VIEW_NS, view_id)
-    if not raw:
+    if not raw or raw.get("_deleted"):
         raise AppError(f"View '{view_id}' not found.", 404)
 
     # Access control: own views or shared views only
@@ -239,6 +241,9 @@ async def list_views(
 
     responses: List[SavedViewResponse] = []
     for raw in all_views:
+        if raw.get("_deleted"):
+            continue
+            
         is_owner = raw.get("user_id") == user_id
         if not is_owner and not raw.get("is_shared", False):
             continue
@@ -250,7 +255,7 @@ async def list_views(
 async def delete_view(view_id: str, requesting_user_id: str) -> bool:
     """Delete a saved view. Only the owner can delete their own views."""
     raw = await kv_store.store.get(DASHBOARD_VIEW_NS, view_id)
-    if not raw:
+    if not raw or raw.get("_deleted"):
         raise AppError(f"View '{view_id}' not found.", 404)
     if raw["user_id"] != requesting_user_id:
         raise AppError("Access denied: only the view owner can delete it.", 403)

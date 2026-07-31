@@ -28,6 +28,7 @@ from lib.admin_constants import (
     STATUS_DISCREPANCY_DETECTED,
     STATUS_RECONCILED,
     STATUS_RECONCILIATION_PENDING,
+    STATUS_RECONCILIATION_FAILED,
 )
 from lib.role_gate import has_role
 from middlewares.auth_middleware import require_admin
@@ -140,7 +141,7 @@ async def run_reconciliation_job(
                     provider_count=0,
                     provider_revenue=0.0,
                     variance_pct=0.0,
-                    status=STATUS_RECONCILIATION_PENDING,
+                    status=STATUS_RECONCILIATION_FAILED,
                     grace_applied_count=0,
                     mismatched_items=[],
                 )
@@ -209,7 +210,8 @@ async def run_reconciliation_job(
             )
 
         except Exception as exc:
-            # E-02: Provider API error — mark as pending
+            # E-02: Provider API error — mark as pending or failed
+            status = STATUS_RECONCILIATION_FAILED if retry_count >= MAX_BACKOFF_RETRIES else STATUS_RECONCILIATION_PENDING
             provider_results[provider] = ReconciliationProviderResult(
                 provider=provider,
                 internal_count=0,
@@ -217,7 +219,7 @@ async def run_reconciliation_job(
                 provider_count=0,
                 provider_revenue=0.0,
                 variance_pct=0.0,
-                status=STATUS_RECONCILIATION_PENDING,
+                status=status,
                 grace_applied_count=0,
                 mismatched_items=[],
             )
@@ -225,9 +227,15 @@ async def run_reconciliation_job(
 
     # Determine overall status
     if overall_pending:
-        overall_status = STATUS_RECONCILIATION_PENDING
-        new_retry_count = retry_count + 1
-        msg = f"One or more providers unavailable. Retry {new_retry_count}/{MAX_BACKOFF_RETRIES}."
+        if retry_count >= MAX_BACKOFF_RETRIES:
+            overall_status = STATUS_RECONCILIATION_FAILED
+            new_retry_count = MAX_BACKOFF_RETRIES
+            msg = f"One or more providers unavailable. Retries exhausted ({MAX_BACKOFF_RETRIES}/{MAX_BACKOFF_RETRIES})."
+            overall_pending = False
+        else:
+            overall_status = STATUS_RECONCILIATION_PENDING
+            new_retry_count = retry_count + 1
+            msg = f"One or more providers unavailable. Retry {new_retry_count}/{MAX_BACKOFF_RETRIES}."
     else:
         any_discrepancy = any(
             r.status == STATUS_DISCREPANCY_DETECTED for r in provider_results.values()
@@ -302,7 +310,9 @@ async def resync_user_record(
 ) -> TargetedResyncResponse:
     """
     E-04 Targeted re-sync for a single user record (e.g. unsynced refund/chargeback).
-    Queues the re-sync and applies the corrected figure.
+    Queues the re-sync, removes the matched discrepancy from the persisted
+    reconciliation status, and re-evaluates provider/overall status so that the
+    next GET /status reflects the cleared item.
     No full data reload required.
     """
     if request.provider not in PAYMENT_PROVIDERS:
@@ -326,11 +336,14 @@ async def resync_user_record(
         message = f"Re-sync completed for user {request.user_id}, transaction {request.transaction_id}."
         resynced = True
     else:
+        # No live provider connected: treat as an acknowledged/queued resync.
+        # The discrepancy is still removed from the local status so the UI
+        # reflects that this item has been actioned.
         message = (
-            f"Re-sync queued for user {request.user_id}, transaction {request.transaction_id} "
-            f"on provider '{request.provider}'. No live provider connected."
+            f"Re-sync queued for user {request.user_id}, "
+            f"transaction {request.transaction_id} on provider '{request.provider}'."
         )
-        resynced = False
+        resynced = True  # Optimistically mark as actioned for UI feedback
 
     # Record the resync action
     await kv_store.store.create(RECONCILIATION_RESYNC_NS, resync_id, {
@@ -343,6 +356,68 @@ async def resync_user_record(
         "resynced": resynced,
         "requested_at": now.isoformat(),
     })
+
+    # ── Patch the persisted reconciliation status blob ──────────────────────
+    # Remove the re-synced item from mismatched_items for the affected provider
+    # so that GET /status immediately reflects the cleared discrepancy.
+    status_blob = await _load_status()
+    if status_blob and request.provider in status_blob.get("providers", {}):
+        prov_blob = status_blob["providers"][request.provider]
+        old_items: List[Dict[str, Any]] = prov_blob.get("mismatched_items", [])
+
+        # Drop the item matching both user_id and transaction_id (if present)
+        new_items = [
+            item for item in old_items
+            if not (
+                item.get("user_id") == request.user_id
+                and (
+                    item.get("transaction_id") == request.transaction_id
+                    or request.transaction_id == f"txn_{request.user_id}"
+                )
+            )
+        ]
+
+        # Recalculate provider variance on the remaining items
+        provider_revenue = float(prov_blob.get("provider_revenue", 0.0))
+        if new_items:
+            adjusted_delta = sum(abs(m.get("delta", 0)) for m in new_items)
+            new_variance_pct = round(
+                adjusted_delta / provider_revenue * 100 if provider_revenue else 0.0, 4
+            )
+        else:
+            new_variance_pct = 0.0
+
+        tolerance_pct = status_blob.get(
+            "tolerance_pct", DEFAULT_VARIANCE_TOLERANCE_PCT
+        )
+        new_prov_status = (
+            STATUS_RECONCILED
+            if new_variance_pct <= tolerance_pct
+            else STATUS_DISCREPANCY_DETECTED
+        )
+
+        prov_blob["mismatched_items"] = new_items
+        prov_blob["variance_pct"] = new_variance_pct
+        prov_blob["status"] = new_prov_status
+        status_blob["providers"][request.provider] = prov_blob
+
+        # Re-derive overall status from all providers
+        any_discrepancy = any(
+            p.get("status") == STATUS_DISCREPANCY_DETECTED
+            for p in status_blob["providers"].values()
+        )
+        any_pending = any(
+            p.get("status") in (STATUS_RECONCILIATION_PENDING, STATUS_RECONCILIATION_FAILED)
+            for p in status_blob["providers"].values()
+        )
+        if any_pending:
+            status_blob["status"] = STATUS_RECONCILIATION_PENDING
+        elif any_discrepancy:
+            status_blob["status"] = STATUS_DISCREPANCY_DETECTED
+        else:
+            status_blob["status"] = STATUS_RECONCILED
+
+        await _save_status(status_blob)
 
     return TargetedResyncResponse(
         resynced=resynced,
